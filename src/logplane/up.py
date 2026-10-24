@@ -39,6 +39,14 @@ def run_up(config_path: Path, *, snapshot: bool, quiet: bool,
     # from a context that ignores SIGINT (a background job, some supervisors).
     signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, _interrupt)
+    # Readiness is checked by polling the address, so anything already answering
+    # there would look like our bus and the coordinator would attach to it.
+    # Refuse before spawning, and never treat a reply as ours if the child died.
+    if _something_answers(url):
+        print(f"logplane: something is already listening at {url}; stop it, or change the "
+              f"port in {config_path} (a bus from an earlier `logplane up` or `serve`?)",
+              file=stderr)
+        return 2
     logs = local.database_path.parent / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ, PYTHONUNBUFFERED="1")
@@ -99,16 +107,28 @@ def _interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
+def _something_answers(url: str) -> bool:
+    try:
+        httpx.get(f"{url}/health", timeout=1)
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def _wait_for_bus(url: str, process: subprocess.Popen, *, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             return False
         try:
-            if httpx.get(f"{url}/health", timeout=1).status_code == 200:
-                return True
+            answered = httpx.get(f"{url}/health", timeout=1).status_code == 200
         except httpx.HTTPError:
-            pass
+            answered = False
+        if answered:
+            # A reply is only ours if the child is still running: a child that
+            # lost the port exits, and the reply came from whoever holds it.
+            time.sleep(0.5)
+            return process.poll() is None
         time.sleep(0.2)
     return False
 

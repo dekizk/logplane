@@ -77,6 +77,43 @@ def free_port():
 
 @unittest.skipIf(os.name != "posix", "uses POSIX signals")
 class UpTests(unittest.TestCase):
+    def test_up_refuses_a_port_something_else_answers_on(self):
+        import http.server
+        import threading
+
+        class Health(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = initialize_local_config(root)
+            value = json.loads(config.read_text())
+            server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+            value["bus"]["port"] = server.server_address[1]
+            config.write_text(json.dumps(value))
+            url = f"http://127.0.0.1:{value['bus']['port']}"
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                environment = {k: v for k, v in os.environ.items() if not k.startswith("LOGPLANE_")}
+                environment["PYTHONPATH"] = str(SRC)
+                result = subprocess.run(
+                    [sys.executable, "-m", "logplane.cli", "up", "--config", str(config)],
+                    cwd=root, env=environment, capture_output=True, text=True, timeout=60)
+            finally:
+                server.shutdown()
+            self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+            self.assertIn("already listening", result.stderr)
+            self.assertNotIn("logplane is up", result.stdout)
+            self.assertNotEqual("running", pm_status(url)["status"])
+            self.assertFalse((root / ".logplane" / "logs" / "pm.log").exists())
+
     def test_up_runs_both_and_stops_both(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

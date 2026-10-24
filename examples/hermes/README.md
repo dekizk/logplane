@@ -140,6 +140,15 @@ coordinator sees leases that expired minutes ago when it wakes, and after
 three such expiries a task fails. On macOS, prefix the command with
 `caffeinate -i`.
 
+Before any paid call, the run lists every chunk it is about to send and asks
+for confirmation (`--yes` answers it). Selection is deliberately conservative:
+hidden files and directories (`.venv`, `.git`, `.env`), dependency and build
+directories (`node_modules`, `venv`, `build`, `dist`, `target`, `vendor`,
+`site-packages`), lock and minified files, and names containing `secret` or
+`credential` are never sent, and inside a git checkout anything `.gitignore`
+excludes is skipped too. Check the preview on a repository you have not
+reviewed before; `--include` narrows it further.
+
 Cost scales with `--max-chunks` and the model. The defaults cost well under
 a dollar on a mid-priced model; a frontier model with `--reasoning high` over
 a large repository can cost several dollars, and the cap step will stop it

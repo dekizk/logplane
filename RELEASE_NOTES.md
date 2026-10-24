@@ -15,6 +15,13 @@ changes.
   either exits on its own, `up` stops the other and exits with status 1. It
   refuses to start when a PM is already running for that bus. `serve` and `pm`
   are unchanged for running the two separately.
+- **`logplane up` refuses a port something else is already answering on**,
+  rather than starting the coordinator against whatever is there, and a reply
+  only counts as the new bus if the child process is still running.
+- **The code review example previews what it will send and skips what it
+  should not.** Hidden, ignored (`.gitignore`), dependency, build, lock, and
+  secret-looking files are never sent to the model, and the run lists every
+  chunk and asks before the first paid call.
 - **`logplane doctor` says whether a coordinator is running.** For a local bus
   it checks the PM's lock on this machine and reports `running` with its
   process ID, or `not running` with the command to start one. Before, a task
