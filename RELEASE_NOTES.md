@@ -1,5 +1,26 @@
 # Release notes
 
+## v0.14.0 — 2026-10-24
+
+Easier first runs. No event, executor-wire, database, or backup format
+changes.
+
+### Changes
+
+- **`logplane up` runs the bus and the coordinator together.** The quick
+  start drops from four terminals to three: `logplane up`, a worker, and a
+  terminal for commands. `up` starts the bus, waits until it is healthy,
+  starts the PM, writes both logs to `.logplane/logs/`, and shows the PM's
+  reconciliation lines. Ctrl-C or `SIGTERM` stops the PM and then the bus; if
+  either exits on its own, `up` stops the other and exits with status 1. It
+  refuses to start when a PM is already running for that bus. `serve` and `pm`
+  are unchanged for running the two separately.
+- **`logplane doctor` says whether a coordinator is running.** For a local bus
+  it checks the PM's lock on this machine and reports `running` with its
+  process ID, or `not running` with the command to start one. Before, a task
+  with no PM to assign it just stayed `open`. The JSON output gains a `pm`
+  object (`status`, `detail`); existing fields are unchanged.
+
 ## v0.13.3 — 2026-10-23
 
 Fixes for bugs found when the [code review example](examples/hermes/README.md#review-a-codebase-with-a-fleet-of-reviewers)

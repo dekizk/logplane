@@ -54,7 +54,7 @@ Every version should preserve these constraints:
 10. **Evidence-driven scope.** Real integrations and failure trials should
     determine which orchestration features are built next.
 
-## Current implementation — v0.13.3
+## Current implementation — v0.14.0
 
 The project already provides the core mechanics needed for a local event-driven
 agent control plane:

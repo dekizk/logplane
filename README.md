@@ -130,22 +130,20 @@ install keeps this checkout as the source of the `logplane` command, so rerun
 
 ## Run your own bus
 
-Run these in four terminals from the folder where you ran `logplane init`,
-with `.venv` activated in each.
-The generated configuration binds only to loopback and keeps runtime data in
-the ignored `.logplane/` directory.
+Run these in three terminals from the folder where you ran `logplane init`,
+with `.venv` activated in each. `logplane up` runs the bus and the coordinator
+(PM) together and stops both on Ctrl-C. The generated configuration binds only
+to loopback and keeps runtime data, including the bus and PM logs, in the
+ignored `.logplane/` directory.
 
 ```sh
 # terminal 1
-logplane serve
+logplane up
 
 # terminal 2
-logplane pm
-
-# terminal 3
 logplane demo-worker alice
 
-# terminal 4
+# terminal 3
 RESPONSE=$(logplane submit "Verify the logplane quick start" --json)
 TASK_ID=$(printf '%s' "$RESPONSE" | python -c \
   'import json,sys; print(json.load(sys.stdin)["payload"]["task_id"])')
@@ -162,7 +160,8 @@ logplane task "$TASK_ID"
 logplane workflow "$CORRELATION_ID"
 ```
 
-The expected state is a healthy schema-v2 bus with one healthy worker, a
+The expected state is a healthy schema-v2 bus with one healthy worker and a
+running coordinator, a
 `completed` task whose last attempt belongs to `alice`, and a one-task
 `completed` workflow. The demo worker emits no model telemetry, so
 `tokens not reported` and `cost not reported` are expected rather than errors.
@@ -191,8 +190,9 @@ print("PASS: workflow reports one completed task")
 </details>
 
 If the task is still `assigned` or `started`, wait briefly and check again. If
-`logplane doctor` keeps warning, the PM, worker, or bus is probably using a
-different URL; see [connecting to the bus](https://github.com/dekizk/logplane/blob/main/docs/operations.md#connecting-to-the-bus).
+it stays `open`, check the `Coordinator:` line in `logplane doctor`: open work
+is only assigned while a coordinator is running. If `logplane doctor` keeps
+warning, the PM, worker, or bus is probably using a different URL; see [connecting to the bus](https://github.com/dekizk/logplane/blob/main/docs/operations.md#connecting-to-the-bus).
 If `logplane` is not found, check that `.venv` is activated in that terminal
 before reinstalling. `logplane tasks` and
 `logplane workflows` find IDs again if you lose them, and
@@ -200,8 +200,10 @@ before reinstalling. `logplane tasks` and
 Mermaid flowchart: another projection over the log, never an editable board.
 
 These checks inspect projected state; they do not prove exactly-once execution
-or external effects. To stop, press Ctrl-C in the worker terminal, then the PM,
-then the server. Local history is preserved.
+or external effects. To stop, press Ctrl-C in the worker terminal, then in the
+`logplane up` terminal, which stops the coordinator and then the bus. Local
+history is preserved. `logplane serve` and `logplane pm` still run the two
+separately when you want them in different terminals or under a supervisor.
 
 ### Try dependencies, decisions, and failures
 
@@ -244,7 +246,8 @@ the task correctly ends `failed`.
 | `logplane decide` / `retry` / `cancel` | Answer a decision, grant more retries, or cancel a task |
 | `logplane pause` / `resume` / `supersede` | Pause or resume a task or workflow, or replace a task with new intent |
 | `logplane policy` / `agent-policy` | Set workflow concurrency and budgets, or per-agent limits |
-| `logplane workers` / `doctor` | Check worker leases and overall bus health |
+| `logplane up` | Run the bus and coordinator together; Ctrl-C stops both (`serve` and `pm` run them separately) |
+| `logplane workers` / `doctor` | Check worker leases, overall bus health, and whether a coordinator is running |
 | `logplane adapter check` / `adapter run` | Verify and run an existing agent as a worker |
 | `logplane backup` / `verify-backup` / `restore` | Verified local backups ([recovery operations](https://github.com/dekizk/logplane/blob/main/RECOVERY.md)) |
 
@@ -356,7 +359,7 @@ the full pre-release procedure.
 logplane was called agent-bus before v0.13.0; if you used it under that name,
 follow the [migration steps](https://github.com/dekizk/logplane/blob/main/RELEASE_NOTES.md#migrating-from-agent-bus).
 
-Current release: **v0.13.3**, fixes for bugs found by the code review example. See the
+Current release: **v0.14.0**, `logplane up` and a coordinator check in `doctor`. See the
 [release notes](https://github.com/dekizk/logplane/blob/main/RELEASE_NOTES.md) and the [roadmap](https://github.com/dekizk/logplane/blob/main/ROADMAP.md) for the path to
 v1.0. Licensed under the [MIT License](https://github.com/dekizk/logplane/blob/main/LICENSE). Copyright (c) 2026 deki. See
 [credits and acknowledgements](https://github.com/dekizk/logplane/blob/main/CONTRIBUTORS.md).

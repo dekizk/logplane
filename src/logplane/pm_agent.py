@@ -5,14 +5,11 @@ effects using stable idempotency keys.
 """
 
 import fcntl
-import getpass
-import hashlib
 import json
 import math
 import os
 import stat
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from logplane.client import BusClient
+from logplane import pm_lock
 from logplane.legacy import check_legacy_environment
 from logplane.projection import (
     ACTIVE_TASK_STATUSES,
@@ -69,15 +67,7 @@ class OrderedProjectionCursor:
 
 
 def _lock_path() -> Path:
-    """One lock per (user, machine, bus URL), not per checkout directory.
-
-    Keyed by bus URL so two PMs from different working copies still exclude
-    each other. This is only a local-process guard: a PM on another machine
-    or running as another OS user is not excluded.
-    """
-    digest = hashlib.sha256(BUS_URL.encode()).hexdigest()[:16]
-    base = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
-    return base / f"logplane-pm-{getpass.getuser()}-{digest}.lock"
+    return pm_lock.lock_path(BUS_URL)
 
 
 LOCK_PATH = _lock_path()

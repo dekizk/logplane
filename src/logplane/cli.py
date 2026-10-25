@@ -121,6 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="run the local event bus")
     serve.add_argument("--config", default="logplane.local.json")
 
+    up = commands.add_parser(
+        "up", help="run the bus and the coordinator together (Ctrl-C stops both)")
+    up.add_argument("--config", default="logplane.local.json")
+    up.add_argument("--snapshot", action="store_true", help="use a disposable local replay snapshot")
+    up.add_argument("--quiet", action="store_true",
+                    help="keep coordinator output in its log file only")
+
     pm = commands.add_parser("pm", help="run the local orchestration manager")
     pm.add_argument("--config", default="logplane.local.json")
     pm.add_argument("--snapshot", action="store_true", help="use a disposable local replay snapshot")
@@ -427,7 +434,7 @@ def main(
             read_pauses=args.read_pauses,
         )
     if args.command in {
-        "init", "serve", "pm", "demo-worker", "submit", "pause", "resume",
+        "init", "up", "serve", "pm", "demo-worker", "submit", "pause", "resume",
         "supersede", "policy", "agent-policy", "adapter", "rebuild-task-index", "snapshot",
         "storage-audit", "backup", "verify-backup", "restore",
     }:
@@ -704,6 +711,11 @@ def _run_local_command(
         )
         return 0
 
+    if args.command == "up":
+        from logplane.up import run_up
+
+        return run_up(Path(args.config), snapshot=args.snapshot, quiet=args.quiet,
+                      stdout=stdout, stderr=stderr)
     if args.command == "serve":
         import uvicorn
 
@@ -991,10 +1003,19 @@ def _doctor(client: ObserverClient, *, now: float, lease_seconds: float) -> dict
         in reconciliation_codes
         for task in state.tasks.values()
     )
+    from logplane.pm_lock import pm_status
+
+    pm = pm_status(client.base_url)
     if pending_reconciliation:
-        warnings.append(
-            f"{pending_reconciliation} task(s) appear to await PM reconciliation; verify the PM is running."
-        )
+        if pm["status"] in {"not_running", "not_found"}:
+            warnings.append(
+                f"{pending_reconciliation} task(s) await the coordinator, and none is running; "
+                "start it with `logplane pm` or `logplane up`."
+            )
+        else:
+            warnings.append(
+                f"{pending_reconciliation} task(s) appear to await PM reconciliation; verify the PM is running."
+            )
     # Reducer validity is diagnosed in one linear replay below; avoid treating
     # deliberately stale historical outcomes as corruption.
     invalid_count = _ignored_event_count(events)
@@ -1009,6 +1030,7 @@ def _doctor(client: ObserverClient, *, now: float, lease_seconds: float) -> dict
         "stale_workers": sum(worker["status"] == "stale" for worker in workers),
         "ignored_replay_events": invalid_count,
         "pending_reconciliation": pending_reconciliation,
+        "pm": pm,
         "warnings": warnings,
     }
 
@@ -1062,6 +1084,15 @@ def _format_doctor(value: dict) -> str:
         f"History: {value['coordination_events']} coordination events · {value['tasks']} tasks",
         f"Workers: {value['healthy_workers']} healthy · {value['stale_workers']} stale",
     ]
+    pm = value.get("pm") or {}
+    status = pm.get("status")
+    if status == "running":
+        lines.append(f"Coordinator: running ({pm['detail']})")
+    elif status in {"not_running", "not_found"}:
+        lines.append("Coordinator: not running · start it with `logplane pm`, or run "
+                     "`logplane up` for the bus and coordinator together")
+    elif status == "unknown":
+        lines.append(f"Coordinator: unknown ({pm['detail']})")
     if value["ignored_replay_events"]:
         lines.append(
             f"Replay: {value['ignored_replay_events']} historical event(s) were safely ignored as stale or invalid"

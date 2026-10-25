@@ -14,6 +14,20 @@ remain environment defaults, with `--token` and `--lease-seconds` available for
 one invocation. Persistent warnings from `logplane doctor` usually mean the
 PM, worker, or bus is not using the same URL.
 
+`logplane up` runs the bus and the PM as two child processes from one
+command, writes their logs to `logs/` beside the database (`.logplane/logs/`
+by default), echoes the PM's reconciliation lines unless `--quiet` is given,
+and stops the PM and then the bus on Ctrl-C or `SIGTERM`. If either process
+exits, `up` stops the other and exits non-zero, so a bus never keeps running
+without its coordinator. It refuses to start if a PM already holds the lock
+for that bus.
+
+`logplane doctor` reports the coordinator alongside the bus and workers. For a
+loopback bus it checks the PM's lock file on this machine: `running` with the
+PM's process ID, `not running`, or, for a non-local bus, `unknown`. When tasks
+are waiting for reconciliation and no PM is running, the warning says so
+directly.
+
 ## Submitting work
 
 When you submit a task, the server assigns its `task_id` atomically. The PM assigns a live worker and emits
