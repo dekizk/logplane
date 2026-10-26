@@ -707,6 +707,15 @@ class BusApiTests(unittest.TestCase):
         self.assertEqual(published.json()["id"], after["last_event_id"])
         self.assertEqual(before["database_id"], after["database_id"])
 
+    def test_startup_marker_is_optional_and_does_not_change_the_health_body(self):
+        with patch.dict(os.environ, {"LOGPLANE_STARTUP_ID": ""}):
+            ordinary = self.client.get("/health")
+        with patch.dict(os.environ, {"LOGPLANE_STARTUP_ID": "this-launch"}):
+            launched = self.client.get("/health")
+        self.assertNotIn("X-Logplane-Startup-Id", ordinary.headers)
+        self.assertEqual("this-launch", launched.headers["X-Logplane-Startup-Id"])
+        self.assertEqual(ordinary.json(), launched.json())
+
     def test_publish_query_and_contract_errors(self):
         self.assertEqual(VERSION, bus.app.version)
         created = self.client.post(

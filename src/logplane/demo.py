@@ -635,6 +635,16 @@ class Harness:
         return self.wait_until(reached, timeout, f"task {task_id} to be {status}")
 
     # -- interaction ------------------------------------------------------
+    def confirm_external_send(self, prompt: str, *, assume_yes: bool = False) -> bool:
+        """Paid/external work requires consent, unlike automatic stand-in demos."""
+        if assume_yes:
+            self.emit(f"  {prompt}: yes (explicit --yes)")
+            return True
+        if not self.interactive:
+            raise DemoError("nothing was sent: external model calls need confirmation. "
+                            "Run in a terminal, or pass --yes to explicitly approve them.")
+        return self.ask(prompt, default="no", choices=("yes", "no")) == "yes"
+
     def ask(self, prompt: str, default: str, choices: Iterable[str] = ()) -> str:
         choices = tuple(choices)
         if not self.interactive:
@@ -1051,27 +1061,48 @@ def run(scenario_name: Optional[str], *, out: TextIO = sys.stdout, pace: float =
             print(f"  {scenario.name:<14} {scenario.summary}", file=out)
         print("\nRun one with: logplane demo recovery", file=out)
         return 0 if scenario_name is None else 2
+
+    def play(harness: Harness) -> None:
+        harness.emit("Real processes, events, and crashes; scripted stand-in agents, so their")
+        harness.emit("outputs, token counts, and costs are simulated.")
+        SCENARIOS[scenario_name].run(harness)
+
+    return run_session(
+        play, prefix=f"logplane-demo-{scenario_name}-", label="logplane demo",
+        out=out, pace=pace, assume_yes=assume_yes, directory=directory,
+        keep_running=keep_running, stdin=stdin, read_pauses=read_pauses,
+    )
+
+
+def run_session(scenario: Callable[[Harness], None], *, prefix: str, label: str,
+                out: TextIO = sys.stdout, pace: float = 1.0, assume_yes: bool = False,
+                directory: Optional[str] = None, keep_running: Optional[bool] = None,
+                stdin: TextIO = sys.stdin, read_pauses: bool = False,
+                lease_seconds: Optional[float] = None) -> int:
+    """Shared lifecycle for scripted demos and repository-pinned real examples.
+
+    Automatic demo answers are not consent to send data externally: real
+    scenarios must call ``confirm_external_send`` before starting paid work.
+    """
     if directory:
         workdir = Path(directory).expanduser().resolve()
         if workdir.exists() and any(workdir.iterdir()):
-            print(f"logplane: demo directory must be new or empty: {workdir}", file=out)
+            print(f"{label}: directory must be new or empty: {workdir}", file=out)
             return 2
         workdir.mkdir(parents=True, exist_ok=True)
     else:
-        workdir = Path(tempfile.mkdtemp(prefix=f"logplane-demo-{scenario_name}-")).resolve()
+        workdir = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     tty = hasattr(stdin, "isatty") and stdin.isatty() and hasattr(out, "isatty") and out.isatty()
     interactive = tty and not assume_yes
     color = hasattr(out, "isatty") and out.isatty() and "NO_COLOR" not in os.environ
     harness = Harness(workdir, out=out, pace=pace, interactive=interactive, color=color,
-                      read_pauses=read_pauses)
-    harness.emit(f"Demo directory: {workdir}")
+                      read_pauses=read_pauses, lease_seconds=lease_seconds)
+    harness.emit(f"Directory: {workdir}")
     harness.emit(f"Bus: {harness.url} (lease {harness.lease_seconds:g}s; separate from any bus "
                  "you already run)")
-    harness.emit("Real processes, events, and crashes; scripted stand-in agents, so their")
-    harness.emit("outputs, token counts, and costs are simulated.")
     code = 0
     try:
-        SCENARIOS[scenario_name].run(harness)
+        scenario(harness)
         if keep_running is None:
             keep_running = interactive
         if keep_running:
@@ -1083,7 +1114,7 @@ def run(scenario_name: Optional[str], *, out: TextIO = sys.stdout, pace: float =
             with contextlib.suppress(EOFError):
                 input("  Press Enter to stop the demo. ")
     except DemoError as exc:
-        harness.emit(f"\nlogplane demo: {exc}")
+        harness.emit(f"\n{label}: {exc}")
         code = 1
     except KeyboardInterrupt:
         code = 130

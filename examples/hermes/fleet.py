@@ -11,11 +11,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import tempfile
 from pathlib import Path
-from typing import Callable, Optional, TextIO
+from typing import Callable, TextIO
 
-from logplane.demo import DemoError, Harness
+from logplane.demo import DemoError, Harness, run_session
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -38,52 +37,22 @@ def add_hermes_arguments(parser: argparse.ArgumentParser, *, default_pace: float
 def run_example(args: argparse.Namespace, scenario: Callable[[Harness, argparse.Namespace], None],
                 *, prefix: str, out: TextIO = sys.stdout, stdin: TextIO = sys.stdin) -> int:
     """Run one scenario with the same lifecycle as ``logplane demo``."""
-    if args.dir:
-        workdir = Path(args.dir).expanduser().resolve()
-        if workdir.exists() and any(workdir.iterdir()):
-            print(f"{prefix}: directory must be new or empty: {workdir}", file=out)
-            return 2
-        workdir.mkdir(parents=True, exist_ok=True)
-    else:
-        workdir = Path(tempfile.mkdtemp(prefix=f"logplane-{prefix}-")).resolve()
-    tty = hasattr(stdin, "isatty") and stdin.isatty() and hasattr(out, "isatty") and out.isatty()
-    interactive = tty and not args.yes
-    color = hasattr(out, "isatty") and out.isatty() and "NO_COLOR" not in os.environ
-    h = Harness(workdir, out=out, pace=args.pace, interactive=interactive, color=color,
-                lease_seconds=args.lease)
-    # Child processes need the repository on their path for the examples package.
-    h.environment["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + h.environment["PYTHONPATH"]
-    h.environment["LOGPLANE_HEARTBEAT_SECONDS"] = str(h.heartbeat_seconds)
-    h.emit(f"Directory: {workdir}")
-    h.emit(f"Bus: {h.url} (lease {h.lease_seconds:g}s; separate from any bus you already run)")
-    h.emit(f"Hermes: {args.provider} / {args.model}, safe mode, clarify toolset only. "
-           "Its model calls are real and paid.")
-    if sys.platform == "darwin":
-        h.emit("This takes a while. If the Mac sleeps, every process pauses and leases expire; "
-               "run under `caffeinate -i` to keep it awake.")
-    code = 0
-    try:
+    def play(h: Harness) -> None:
+        # Child processes need the repository on their path for the examples package.
+        h.environment["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + h.environment["PYTHONPATH"]
+        h.environment["LOGPLANE_HEARTBEAT_SECONDS"] = str(h.heartbeat_seconds)
+        h.emit(f"Hermes: {args.provider} / {args.model}, safe mode, clarify toolset only. "
+               "Its model calls are real and paid.")
+        if sys.platform == "darwin":
+            h.emit("This takes a while. If the Mac sleeps, every process pauses and leases expire; "
+                   "run under `caffeinate -i` to keep it awake.")
         scenario(h, args)
-        keep_running = args.keep_running if args.keep_running is not None else interactive
-        if keep_running:
-            h.say(f"The bus is still running at {h.url}. Explore it from another terminal:")
-            h.block(f"logplane --url {h.url} workflows\nlogplane --url {h.url} tasks")
-            h._tail_stop.set()
-            try:
-                input("  Press Enter to stop. ")
-            except EOFError:
-                pass
-    except DemoError as exc:
-        h.emit(f"\n{prefix}: {exc}")
-        code = 1
-    except KeyboardInterrupt:
-        code = 130
-    finally:
-        h.stop_all()
-    h.emit()
-    h.emit(f"History is kept in {workdir}. To reopen it later:")
-    h.emit(f"  logplane serve --config {h.config_path}")
-    return code
+
+    return run_session(
+        play, prefix=f"logplane-{prefix}-", label=prefix, out=out, stdin=stdin,
+        directory=args.dir, pace=args.pace, assume_yes=args.yes,
+        keep_running=args.keep_running, lease_seconds=args.lease,
+    )
 
 
 def start_hermes_worker(h: Harness, args: argparse.Namespace, name: str,

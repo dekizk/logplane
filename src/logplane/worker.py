@@ -5,7 +5,6 @@ import os
 import threading
 import time
 
-from logplane.client import BusClient
 from logplane.legacy import check_legacy_environment
 from logplane.executors import (
     AssignmentContext,
@@ -14,7 +13,6 @@ from logplane.executors import (
     PermanentFailure,
     RetryableFailure,
 )
-from logplane.runtime import WorkerRuntime
 
 BUS_URL = os.environ.get("LOGPLANE_URL", "http://127.0.0.1:8765")
 HEARTBEAT_SECONDS = float(os.environ.get("LOGPLANE_HEARTBEAT_SECONDS", "5"))
@@ -66,58 +64,42 @@ class DemoExecutor:
         )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
+    from logplane.cli import add_demo_worker_arguments
+
     parser = argparse.ArgumentParser(description="Run a demo logplane worker")
-    parser.add_argument("name")
-    outcome = parser.add_mutually_exclusive_group()
-    outcome.add_argument("--block", type=int, help="block this task once")
-    outcome.add_argument(
-        "--fail",
-        type=int,
-        help="report one retryable failure for this task",
-    )
-    outcome.add_argument(
-        "--fail-permanently",
-        type=int,
-        help="report one permanent failure for this task",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.5,
-        help="simulated work time per task in seconds",
-    )
-    parser.add_argument("--capacity", type=int, default=1)
-    parser.add_argument(
-        "--capability",
-        action="append",
-        default=[],
-        dest="capabilities",
-        help="worker capability; repeat for more than one",
-    )
-    return parser.parse_args()
+    add_demo_worker_arguments(parser)
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    check_legacy_environment()
-    args = parse_args()
+def run_demo_worker(args: argparse.Namespace, *, bus_url: str,
+                    heartbeat_seconds: float = 5.0) -> None:
+    from logplane.client import BusClient
+    from logplane.runtime import WorkerRuntime
+
     executor = DemoExecutor(
         args.name,
         block_once=args.block,
         fail_once=args.fail,
         fail_permanently_once=args.fail_permanently,
-        delay_seconds=getattr(args, "delay", 0.5),
+        delay_seconds=args.delay,
     )
-    bus = BusClient(BUS_URL, actor=args.name)
+    bus = BusClient(bus_url, actor=args.name)
     runtime = WorkerRuntime(
         bus,
         name=args.name,
         executor=executor,
         capacity=args.capacity,
         capabilities=args.capabilities,
-        heartbeat_seconds=HEARTBEAT_SECONDS,
+        heartbeat_seconds=heartbeat_seconds,
     )
     runtime.run()
+
+
+def main() -> None:
+    """Compatibility entry point: keep the environment-only launch supported."""
+    check_legacy_environment()
+    run_demo_worker(parse_args(), bus_url=BUS_URL, heartbeat_seconds=HEARTBEAT_SECONDS)
 
 
 if __name__ == "__main__":

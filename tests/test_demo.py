@@ -277,6 +277,34 @@ class NarrationWrapTests(unittest.TestCase):
 
 
 class DemoCommandTests(unittest.TestCase):
+    def test_shared_session_always_cleans_up(self):
+        for error, expected in ((None, 0), (demo.DemoError("scenario failed"), 1),
+                                (KeyboardInterrupt(), 130), (RuntimeError("unexpected"), None)):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory, \
+                 unittest.mock.patch.object(demo.Harness, "stop_all") as stop, \
+                 unittest.mock.patch.object(demo, "_free_port", return_value=12345):
+                out = io.StringIO()
+
+                def scenario(harness):
+                    # Non-interactive scripted demonstrations retain automatic
+                    # answers; those are separate from external-send consent.
+                    self.assertEqual("yes", harness.ask("Simulated approval?", default="yes"))
+                    if error is not None:
+                        raise error
+
+                def run():
+                    return demo.run_session(scenario, prefix="test-", label="test", out=out,
+                                            stdin=io.StringIO(), directory=directory,
+                                            keep_running=False)
+
+                if expected is None:
+                    with self.assertRaisesRegex(RuntimeError, "unexpected"):
+                        run()
+                else:
+                    self.assertEqual(expected, run())
+                    self.assertIn("History is kept", out.getvalue())
+                stop.assert_called_once_with()
+
     def test_listing_and_unknown_scenarios(self):
         out = io.StringIO()
         self.assertEqual(0, demo.run(None, out=out))
