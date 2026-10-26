@@ -23,7 +23,9 @@ Point ``--path`` at your own repository to review it instead. Costs scale with
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, TextIO
@@ -127,14 +129,60 @@ def render_report(findings: list[dict], choice: str) -> str:
 
 # -- splitting the source ----------------------------------------------------
 
+# Never sent for review, whatever --include says: tooling, dependencies, build
+# output, and anything hidden. A git checkout also honours its .gitignore.
+EXCLUDED_DIRS = frozenset({
+    "__pycache__", "node_modules", "venv", "env", "build", "dist", "target",
+    "site-packages", "vendor", "third_party",
+})
+EXCLUDED_FILES = ("*.min.*", "*.lock", "*.pem", "*.key", "*secret*", "*credential*", "*.env")
+
+
+def select_files(root: Path, include: str) -> list[Path]:
+    """Files under root that match ``include`` and are safe to send for review.
+
+    In a git checkout, only files git tracks or does not ignore are eligible,
+    so .gitignore applies. Hidden directories and files (.venv, .git, .env),
+    common dependency and build directories, and secret-looking names are
+    always skipped.
+    """
+    tracked = _git_visible_files(root)
+    chosen = []
+    for path in sorted(root.rglob(include)):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(root)
+        parts = relative.parts
+        if any(part.startswith(".") for part in parts) or any(part in EXCLUDED_DIRS for part in parts[:-1]):
+            continue
+        if any(fnmatch.fnmatch(path.name.lower(), pattern) for pattern in EXCLUDED_FILES):
+            continue
+        if tracked is not None and relative.as_posix() not in tracked:
+            continue
+        chosen.append(path)
+    return chosen
+
+
+def _git_visible_files(root: Path) -> Optional[set[str]]:
+    """Paths git would not ignore, relative to root; None outside a checkout."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return {item.decode("utf-8", "replace") for item in completed.stdout.split(b"\0") if item}
+
+
 def chunk_files(root: Path, include: str, chunk_bytes: int, max_chunks: int) -> list[dict]:
-    """Split matching files into line-aligned chunks of at most chunk_bytes.
+    """Split selected files into line-aligned chunks of at most chunk_bytes.
 
     Files are taken largest first and their chunks interleaved, so a small
     ``max_chunks`` still samples several files rather than one file's start.
     """
-    files = sorted((p for p in root.rglob(include) if p.is_file() and "__pycache__" not in p.parts),
-                   key=lambda p: (-p.stat().st_size, str(p)))
+    files = sorted(select_files(root, include), key=lambda p: (-p.stat().st_size, str(p)))
     per_file = []
     for path in files:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
@@ -201,9 +249,16 @@ def _scenario(h: Harness, args: argparse.Namespace) -> None:
     files = sorted({c["file"] for c in chunks})
 
     h.title("A code review by a fleet of real agents")
-    h.say(f"{len(chunks)} chunks ({total_kb:.0f} KB) from {len(files)} file(s) under {root}, "
-          f"reviewed by {args.workers} Hermes workers in parallel. Every review is a real "
-          "model call. A Python agent files the findings at the end, after you choose which.")
+    h.say(f"{len(chunks)} chunks ({total_kb:.0f} KB) from {len(files)} file(s) under {root} "
+          f"will be sent to {args.provider} / {args.model}, reviewed by {args.workers} Hermes "
+          "workers in parallel. Every review is a real model call. A Python agent files the "
+          "findings at the end, after you choose which.")
+    h.say("What will be sent (hidden, ignored, dependency, build, and secret-looking files "
+          "are skipped):")
+    h.block("\n".join(f"{c['file']} lines {c['start_line']}-{c['end_line']} "
+                      f"({len(c['code'].encode('utf-8')) / 1024:.1f} KB)" for c in chunks))
+    if h.ask("Send these chunks for review? (yes/no)", default="yes", choices=("yes", "no")) == "no":
+        raise DemoError("nothing was sent; adjust --path, --include, or --max-chunks and rerun")
     h.start_bus()
     h.start_pm()
     reviewers = [f"reviewer-{n}" for n in range(1, args.workers + 1)]

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -42,6 +43,7 @@ def assignment(**overrides):
 
 FAKE_HERMES = r'''import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -445,6 +447,23 @@ class FilerExecutorTests(unittest.TestCase):
             self.assertEqual({"filed": 0, "skipped": 1}, {k: again.result[k] for k in ("filed", "skipped")})
             self.assertIn("**high** `a.py:1` A", (workdir / code_review.REPORT).read_text())
 
+    def test_selection_skips_hidden_ignored_dependency_and_secret_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("x = 1\n")
+            (root / "private_config.py").write_text("token = 'x'\n")
+            (root / "secrets.py").write_text("")
+            for folder in (".venv", "node_modules", "build"):
+                (root / folder).mkdir()
+                (root / folder / "vendor.py").write_text("y = 2\n")
+            names = [p.name for p in code_review.select_files(root, "*.py")]
+            self.assertEqual(["app.py", "private_config.py"], names)
+
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text("private_config.py\n")
+            names = [p.name for p in code_review.select_files(root, "*.py")]
+            self.assertEqual(["app.py"], names)
+
     def test_chunks_interleave_files_largest_first(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -479,6 +498,8 @@ class HermesCodeReviewLiveTests(unittest.TestCase):
             code = code_review.run(args, out=out, stdin=io.StringIO())
         text = out.getvalue()
         self.assertEqual(0, code, text)
+        self.assertIn("What will be sent", text)
+        self.assertIn("alpha.py lines 1-", text)
         self.assertIn("was killed (kill -9)", text)
         self.assertIn("New work stopped after", text)
         self.assertIn("(2 batch merges, then a final merge)", text)
