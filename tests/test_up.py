@@ -11,9 +11,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import httpx
 
 from logplane import cli as logplane_cli
+from logplane import up as launcher
 from logplane.local_config import initialize_local_config
 from logplane.pm_lock import lock_path, pm_status
 from tests.test_cli import FakeObserver
@@ -77,6 +80,46 @@ def free_port():
 
 @unittest.skipIf(os.name != "posix", "uses POSIX signals")
 class UpTests(unittest.TestCase):
+    def test_readiness_requires_this_childs_marker_not_just_a_living_child(self):
+        for headers in ({}, {"X-Logplane-Startup-Id": "another-launch"}):
+            with self.subTest(headers=headers):
+                child = Mock()
+                child.poll.side_effect = [None, None, 2]
+                with patch.object(launcher.httpx, "get", return_value=httpx.Response(200, headers=headers)), \
+                     patch.object(launcher.time, "sleep"):
+                    self.assertFalse(launcher._wait_for_bus(
+                        "http://unused", child, startup_id="this-launch", timeout=20))
+
+        child = Mock()
+        for exit_code, expected in ((None, True), (2, False)):
+            with self.subTest(exit_code=exit_code):
+                child.poll.side_effect = [None, exit_code]
+                with patch.object(launcher.httpx, "get", return_value=httpx.Response(
+                        200, headers={"X-Logplane-Startup-Id": "this-launch"})):
+                    self.assertEqual(expected, launcher._wait_for_bus(
+                        "http://unused", child, startup_id="this-launch", timeout=20))
+
+    def test_listener_arriving_after_preflight_never_starts_the_pm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = initialize_local_config(directory)
+            child = Mock()
+            # The new bus stays alive while another process answers health,
+            # then exits after losing the bind race.
+            child.poll.side_effect = [None, None, 2, 2, 2]
+            with patch.object(launcher, "pm_status", return_value={"status": "not_running"}), \
+                 patch.object(launcher, "_something_answers", return_value=False), \
+                 patch.object(launcher.signal, "signal"), \
+                 patch.object(launcher.subprocess, "Popen", return_value=child) as spawn, \
+                 patch.object(launcher.httpx, "get", return_value=httpx.Response(200)), \
+                 patch.object(launcher.time, "sleep"):
+                out, err = io.StringIO(), io.StringIO()
+                code = launcher.run_up(config, snapshot=False, quiet=False, stdout=out, stderr=err)
+            self.assertEqual(2, code)
+            self.assertEqual(1, spawn.call_count, "must not spawn the coordinator")
+            self.assertIn("did not start", err.getvalue())
+            self.assertNotIn("logplane is up", out.getvalue())
+            self.assertTrue(spawn.call_args.kwargs["env"]["LOGPLANE_STARTUP_ID"])
+
     def test_up_refuses_a_port_something_else_answers_on(self):
         import http.server
         import threading

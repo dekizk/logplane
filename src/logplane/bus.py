@@ -2071,7 +2071,12 @@ async def get_event(event_id: int) -> dict:
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health(response: Response) -> dict:
+    # Local launcher readiness, not an authentication credential. Only the bus
+    # child receives this per-launch marker; ordinary `serve` needs no marker.
+    startup_id = os.environ.get("LOGPLANE_STARTUP_ID")
+    if startup_id:
+        response.headers["X-Logplane-Startup-Id"] = startup_id
     def identity():
         with db() as conn:
             row = conn.execute("SELECT value, (SELECT COALESCE(MAX(id), 0) FROM events) "

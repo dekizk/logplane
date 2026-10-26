@@ -162,27 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     demo = commands.add_parser(
         "demo-worker", help="run a bounded worker for the local quick start"
     )
-    demo.add_argument("name")
     demo.add_argument("--config", default="logplane.local.json")
-    demo.add_argument("--capacity", type=_positive_int, default=1)
-    demo.add_argument("--capability", action="append", default=[])
-    demo_outcome = demo.add_mutually_exclusive_group()
-    demo_outcome.add_argument(
-        "--block", type=_positive_int, metavar="TASK_ID",
-        help="block this task once and ask a human for a decision",
-    )
-    demo_outcome.add_argument(
-        "--fail", type=_positive_int, metavar="TASK_ID",
-        help="report one retryable failure for this task",
-    )
-    demo_outcome.add_argument(
-        "--fail-permanently", type=_positive_int, metavar="TASK_ID",
-        help="report one permanent failure for this task",
-    )
-    demo.add_argument(
-        "--delay", type=_nonnegative_number, default=0.5, metavar="SECONDS",
-        help="simulated work time per task (default 0.5); raise it to kill a worker mid-task",
-    )
+    add_demo_worker_arguments(demo)
 
     demo_command = commands.add_parser(
         "demo", help="run a scripted, self-contained demonstration scenario",
@@ -750,24 +731,9 @@ def _run_local_command(
         pm_agent.main(snapshot_path=local.database_path if args.snapshot else None)
         return 0
     if args.command == "demo-worker":
-        from logplane.client import BusClient
-        from logplane.runtime import WorkerRuntime
-        from logplane.worker import DemoExecutor
+        from logplane.worker import run_demo_worker
 
-        runtime = WorkerRuntime(
-            BusClient(local.bus_url, actor=args.name),
-            name=args.name,
-            executor=DemoExecutor(
-                args.name,
-                block_once=args.block,
-                fail_once=args.fail,
-                fail_permanently_once=args.fail_permanently,
-                delay_seconds=args.delay,
-            ),
-            capacity=args.capacity,
-            capabilities=args.capability,
-        )
-        runtime.run()
+        run_demo_worker(args, bus_url=local.bus_url)
         return 0
     if args.command == "submit":
         from logplane.client import BusClient
@@ -1294,6 +1260,24 @@ def _friendly_error(exc: Exception) -> str:
             return "authentication failed; set LOGPLANE_TOKEN or pass --token"
         return f"server returned HTTP {exc.response.status_code}"
     return str(exc)
+
+
+def add_demo_worker_arguments(parser: argparse.ArgumentParser) -> None:
+    """One flag/validation contract for the CLI and the legacy module entry point."""
+    parser.add_argument("name")
+    parser.add_argument("--capacity", type=_positive_int, default=1)
+    parser.add_argument("--capability", action="append", default=[], dest="capabilities")
+    outcome = parser.add_mutually_exclusive_group()
+    for flag, description in (
+        ("--block", "block this task once and ask a human for a decision"),
+        ("--fail", "report one retryable failure for this task"),
+        ("--fail-permanently", "report one permanent failure for this task"),
+    ):
+        outcome.add_argument(flag, type=_positive_int, metavar="TASK_ID", help=description)
+    parser.add_argument(
+        "--delay", type=_nonnegative_number, default=0.5, metavar="SECONDS",
+        help="simulated work time per task (default 0.5); raise it to kill a worker mid-task",
+    )
 
 
 def _positive_int(value: str) -> int:

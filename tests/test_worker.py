@@ -1,8 +1,10 @@
 import unittest
+import io
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from logplane import worker
+from logplane import cli
 from logplane.executors import (
     AssignmentContext,
     Blocked,
@@ -51,14 +53,15 @@ class WorkerMainTests(unittest.TestCase):
             block=None,
             fail=4,
             fail_permanently=None,
+            delay=0.5,
         )
         fake_bus = Mock()
         fake_runtime = Mock()
 
         with (
             patch("logplane.worker.parse_args", return_value=args),
-            patch("logplane.worker.BusClient", return_value=fake_bus) as client_class,
-            patch("logplane.worker.WorkerRuntime", return_value=fake_runtime) as runtime_class,
+            patch("logplane.client.BusClient", return_value=fake_bus) as client_class,
+            patch("logplane.runtime.WorkerRuntime", return_value=fake_runtime) as runtime_class,
         ):
             worker.main()
 
@@ -70,6 +73,19 @@ class WorkerMainTests(unittest.TestCase):
         self.assertEqual(["python"], kwargs["capabilities"])
         self.assertIsInstance(kwargs["executor"], worker.DemoExecutor)
         fake_runtime.run.assert_called_once_with()
+
+    def test_entry_points_share_flags_and_validation(self):
+        parsers = (worker.parse_args, lambda argv: cli.build_parser().parse_args(["demo-worker", *argv]))
+        for parse in parsers:
+            args = parse(["alice", "--capacity", "2", "--capability", "python",
+                          "--delay", "1.5", "--fail", "4"])
+            self.assertEqual((2, ["python"], 1.5, 4),
+                             (args.capacity, args.capabilities, args.delay, args.fail))
+            for flags in (["--capacity", "0"], ["--delay", "nan"], ["--block", "-1"],
+                          ["--block", "1", "--fail", "2"]):
+                with self.subTest(parse=parse, flags=flags), patch("sys.stderr", io.StringIO()), \
+                     self.assertRaises(SystemExit):
+                    parse(["alice", *flags])
 
 
 if __name__ == "__main__":

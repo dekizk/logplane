@@ -141,13 +141,18 @@ three such expiries a task fails. On macOS, prefix the command with
 `caffeinate -i`.
 
 Before any paid call, the run lists every chunk it is about to send and asks
-for confirmation (`--yes` answers it). Selection is deliberately conservative:
+for confirmation (default **no**; `--yes` explicitly approves it). With redirected
+or piped output, including `tee`, or without an interactive terminal, the run
+stops unless you pass `--yes`. Selection is deliberately conservative:
 hidden files and directories (`.venv`, `.git`, `.env`), dependency and build
 directories (`node_modules`, `venv`, `build`, `dist`, `target`, `vendor`,
 `site-packages`), lock and minified files, and names containing `secret` or
-`credential` are never sent, and inside a git checkout anything `.gitignore`
-excludes is skipped too. Check the preview on a repository you have not
-reviewed before; `--include` narrows it further.
+`credential` are excluded. Inside a Git checkout only tracked and non-ignored
+files are eligible; a Git error or timeout stops the review instead of bypassing
+ignore rules. Git must be available to establish whether the directory is a
+checkout. These are filename filters, not a secret scanner: eligible source
+files can still contain sensitive content. Check the preview and the source
+before approving; `--include` narrows the selection further.
 
 Cost scales with `--max-chunks` and the model. The defaults cost well under
 a dollar on a mid-priced model; a frontier model with `--reasoning high` over

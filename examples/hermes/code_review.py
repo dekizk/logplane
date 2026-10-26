@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -139,12 +140,12 @@ EXCLUDED_FILES = ("*.min.*", "*.lock", "*.pem", "*.key", "*secret*", "*credentia
 
 
 def select_files(root: Path, include: str) -> list[Path]:
-    """Files under root that match ``include`` and are safe to send for review.
+    """Files under root that match ``include`` and are eligible for the preview.
 
     In a git checkout, only files git tracks or does not ignore are eligible,
     so .gitignore applies. Hidden directories and files (.venv, .git, .env),
     common dependency and build directories, and secret-looking names are
-    always skipped.
+    always skipped. These filename filters are not a content/secret scanner.
     """
     tracked = _git_visible_files(root)
     chosen = []
@@ -168,11 +169,20 @@ def _git_visible_files(root: Path) -> Optional[set[str]]:
     try:
         completed = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            capture_output=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+            capture_output=True, timeout=30, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DemoError("could not apply Git ignore rules; nothing was sent. "
+                        "Check that Git is installed and can read the checkout.") from exc
     if completed.returncode != 0:
-        return None
+        # A genuine non-checkout can use the directory filters. Any other Git
+        # failure must not silently expand the set of files sent to a model.
+        not_repo = completed.stderr.startswith(b"fatal: not a git repository")
+        git_marker = any((parent / ".git").exists() or (parent / ".git").is_symlink()
+                         for parent in (root, *root.parents))
+        if not_repo and not git_marker and not os.environ.get("GIT_DIR"):
+            return None
+        raise DemoError("could not apply Git ignore rules; nothing was sent. "
+                        "Run git status in the review directory to diagnose the failure.")
     return {item.decode("utf-8", "replace") for item in completed.stdout.split(b"\0") if item}
 
 
@@ -257,7 +267,7 @@ def _scenario(h: Harness, args: argparse.Namespace) -> None:
           "are skipped):")
     h.block("\n".join(f"{c['file']} lines {c['start_line']}-{c['end_line']} "
                       f"({len(c['code'].encode('utf-8')) / 1024:.1f} KB)" for c in chunks))
-    if h.ask("Send these chunks for review? (yes/no)", default="yes", choices=("yes", "no")) == "no":
+    if not h.confirm_external_send("Send these chunks for review? (yes/no)", assume_yes=args.yes):
         raise DemoError("nothing was sent; adjust --path, --include, or --max-chunks and rerun")
     h.start_bus()
     h.start_pm()

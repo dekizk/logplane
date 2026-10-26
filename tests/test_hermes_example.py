@@ -13,6 +13,7 @@ from unittest.mock import ANY, Mock, patch
 from examples.hermes.hermes_executor import HermesExecutor
 from examples.hermes import code_review, live_smoke, run_worker
 from logplane.artifacts import ArtifactStore
+from logplane.demo import DemoError, Harness
 from logplane.executors import (
     AssignmentContext,
     Blocked,
@@ -405,6 +406,14 @@ args = sys.argv[1:]
 prompt = args[args.index("-z") + 1]
 payload = json.loads(prompt[prompt.index("ASSIGNMENT_JSON") + len("ASSIGNMENT_JSON"):])
 context = payload.get("context", {})
+# Keep the selected fake call in flight until its worker is killed. A fixed
+# three-second delay can finish during submission on slower CI machines.
+if os.environ.get("FAKE_CRASH_VICTIM") == payload.get("assignee"):
+    parent = os.getppid()
+    deadline = time.monotonic() + 60
+    while os.getppid() == parent and time.monotonic() < deadline:
+        time.sleep(0.05)
+    raise SystemExit(0)
 Path(args[args.index("--usage-file") + 1]).write_text(json.dumps(
     {"input_tokens": 3000, "output_tokens": 400, "total_tokens": 3400,
      "estimated_cost_usd": 0.01, "model": "fake"}))
@@ -464,6 +473,55 @@ class FilerExecutorTests(unittest.TestCase):
             names = [p.name for p in code_review.select_files(root, "*.py")]
             self.assertEqual(["app.py"], names)
 
+    def test_git_failures_never_disable_ignore_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text("private_config.py\n")
+            (root / "private_config.py").write_text("token = 'not-for-review'\n")
+            for error in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 30)):
+                with self.subTest(error=error), \
+                     patch.object(code_review.subprocess, "run", side_effect=error), \
+                     self.assertRaisesRegex(DemoError, "could not apply Git ignore rules"):
+                    code_review.select_files(root, "*.py")
+            for message in (b"fatal: detected dubious ownership", b"fatal: not a git repository"):
+                with self.subTest(message=message), \
+                     patch.object(code_review.subprocess, "run", return_value=subprocess.CompletedProcess(
+                         "git", 128, stdout=b"", stderr=message)), \
+                     self.assertRaisesRegex(DemoError, "nothing was sent"):
+                    code_review.select_files(root, "*.py")
+
+    def test_redirected_review_requires_explicit_yes_before_starting_any_process(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "src"
+            source.mkdir()
+            (source / "app.py").write_text("pass\n")
+            for name, stdin in (("redirected-output", Terminal()), ("no-terminal", io.StringIO())):
+                with self.subTest(name=name), patch.object(Harness, "start_bus") as start:
+                    out = io.StringIO()
+                    args = code_review.parse_args([
+                        "--provider", "unused", "--model", "unused", "--path", str(source),
+                        "--dir", str(root / name)])
+                    self.assertEqual(1, code_review.run(args, out=out, stdin=stdin))
+                    start.assert_not_called()
+                    self.assertIn("pass --yes", out.getvalue())
+
+    def test_external_send_confirmation_declines_empty_input_and_eof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            h = Harness(Path(directory), out=io.StringIO(), interactive=True)
+            for answer in ("", "no", EOFError()):
+                with self.subTest(answer=answer), patch("builtins.input", side_effect=[answer]):
+                    self.assertFalse(h.confirm_external_send("Send?"))
+            with patch("builtins.input", return_value="yes"):
+                self.assertTrue(h.confirm_external_send("Send?"))
+            h.interactive = False
+            self.assertTrue(h.confirm_external_send("Send?", assume_yes=True))
+
     def test_chunks_interleave_files_largest_first(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -489,7 +547,7 @@ class HermesCodeReviewLiveTests(unittest.TestCase):
         for name in ("alpha", "beta", "gamma"):
             (source / f"{name}.py").write_text(f"# {name}\n" + "pass\n" * 60)
         out = io.StringIO()
-        with patch.dict(os.environ, {"FAKE_SLEEP": "3"}):
+        with patch.dict(os.environ, {"FAKE_SLEEP": "3", "FAKE_CRASH_VICTIM": "reviewer-2"}):
             args = code_review.parse_args([
                 "--provider", "fake", "--model", "fake", "--hermes-command", str(fake),
                 "--path", str(source), "--chunk-bytes", "100", "--max-chunks", "9",
