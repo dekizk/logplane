@@ -1,6 +1,9 @@
 # Release notes
 
-## Unreleased
+## v0.14.1 — 2026-10-26
+
+Hardening from an external review of v0.14.0. No event, executor-wire,
+database, or backup format changes.
 
 - **Startup checks identify this launch's bus.** `logplane up` gives its bus
   child a fresh readiness marker and checks the health-response header before
@@ -9,15 +12,14 @@
 - **Source review stops when Git filtering fails.** Missing Git, timeouts,
   ownership errors, and broken checkouts no longer silently disable ignore
   rules. Only a confirmed non-checkout uses directory filtering alone.
-- **External-send consent is explicit.** The Hermes code-review preview defaults
-  to no. Piped/redirected or non-interactive runs require `--yes`; automatic
-  answers in simulated demos do not authorize paid source uploads.
+- **External-send consent is explicit.** The Hermes code-review preview now
+  defaults to **no**, so pressing Enter declines where it used to approve.
+  Piped/redirected or non-interactive runs stop unless `--yes` is passed;
+  automatic answers in simulated demos do not authorize paid source uploads.
 - **Shared worker and demo setup.** Both demo-worker entry points use the same
   flag validation and runtime wiring. Scripted demos and Hermes fleet examples
   share directory setup, cleanup, and reopening instructions. The standalone
   worker's environment-only launch remains supported.
-
-No event, executor-wire, database, or backup format changes.
 
 ## v0.14.0 — 2026-10-24
 
