@@ -23,7 +23,7 @@ require a passing package-install smoke, not just tests in an editable checkout.
 
 | Surface | Current baseline | Compatibility boundary |
 | --- | --- | --- |
-| Package | `0.14.0` release | Pre-1.0 changes must be documented; do not infer a 1.x guarantee yet |
+| Package | `0.14.1` release | Pre-1.0 changes must be documented; do not infer a 1.x guarantee yet |
 | Python integration | Names exported by `logplane`, `logplane.adapters`, `logplane.protocol` | Documented constructors, methods, typed outcomes, and effect identity |
 | Executor wire format | `agent-bus.executor` v1 | Selected envelope version is explicit; headers are strict |
 | Event envelope | Built-in writes use schema v2 | History is immutable; acceptance and replay semantics are part of the contract |

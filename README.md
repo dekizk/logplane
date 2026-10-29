@@ -359,7 +359,7 @@ the full pre-release procedure.
 logplane was called agent-bus before v0.13.0; if you used it under that name,
 follow the [migration steps](https://github.com/dekizk/logplane/blob/main/RELEASE_NOTES.md#migrating-from-agent-bus).
 
-Current release: **v0.14.0**, `logplane up` and a coordinator check in `doctor`. See the
+Current release: **v0.14.1**, `logplane up` and a coordinator check in `doctor`, hardened. See the
 [release notes](https://github.com/dekizk/logplane/blob/main/RELEASE_NOTES.md) and the [roadmap](https://github.com/dekizk/logplane/blob/main/ROADMAP.md) for the path to
 v1.0. Licensed under the [MIT License](https://github.com/dekizk/logplane/blob/main/LICENSE). Copyright (c) 2026 deki. See
 [credits and acknowledgements](https://github.com/dekizk/logplane/blob/main/CONTRIBUTORS.md).
