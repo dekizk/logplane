@@ -9,7 +9,7 @@ from unittest.mock import patch
 from logplane import bus
 from logplane import pm_agent
 from logplane.pm_agent import PMState, apply_event, plan_next_emission, reconcile
-from logplane.topics import COORDINATION_TOPICS, INTEGRATION_TOPICS, TELEMETRY_TOPICS
+from logplane.topics import COORDINATION_TOPICS, INTEGRATION_TOPICS, KNOWN_TOPICS, TELEMETRY_TOPICS
 
 
 def event(
@@ -1401,7 +1401,7 @@ class PMMainTests(unittest.TestCase):
         )
         self.assertEqual(expected, fake_bus.subscribe_calls[0]["topics"])
         self.assertEqual(set(COORDINATION_TOPICS), set(pm_agent.PM_TOPICS))
-        self.assertLessEqual(set(COORDINATION_TOPICS), set(bus.KNOWN_TOPICS))
+        self.assertLessEqual(set(COORDINATION_TOPICS), set(KNOWN_TOPICS))
         self.assertTrue(set(INTEGRATION_TOPICS).isdisjoint(pm_agent.PM_TOPICS))
         self.assertTrue(set(TELEMETRY_TOPICS).isdisjoint(pm_agent.PM_TOPICS))
 

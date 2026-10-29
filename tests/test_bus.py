@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from logplane import bus
+from logplane import bus, limits
 from logplane.version import VERSION
 from fastapi.testclient import TestClient
 
@@ -211,7 +211,7 @@ class BusStorageTests(unittest.TestCase):
                 "human",
                 {
                     "title": "too much fan-in",
-                    "depends_on": list(range(1, bus.MAX_TASK_DEPENDENCIES + 2)),
+                    "depends_on": list(range(1, limits.MAX_TASK_DEPENDENCIES + 2)),
                 },
             )
 
@@ -314,7 +314,7 @@ class BusStorageTests(unittest.TestCase):
             },
             {
                 "title": "too large",
-                "context": {"value": "x" * bus.MAX_INLINE_CONTEXT_BYTES},
+                "context": {"value": "x" * limits.MAX_INLINE_CONTEXT_BYTES},
             },
             {
                 "title": "wrong owner",

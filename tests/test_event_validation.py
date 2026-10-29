@@ -24,11 +24,18 @@ class EventValidationTests(unittest.TestCase):
                      "_is_positive_int", "_is_nonnegative_int", "_is_nonnegative_number"):
             with self.subTest(name=name):
                 self.assertIs(getattr(bus, name), getattr(event_validation, name))
-        for name in ("CURRENT_SCHEMA_VERSION", "MAX_CORRELATION_ID_LENGTH",
-                     "MAX_PRODUCER_FIELD_LENGTH", "MAX_INLINE_CONTEXT_BYTES",
-                     "MAX_TASK_DEPENDENCIES", "KNOWN_TOPICS"):
+        for name in ("CURRENT_SCHEMA_VERSION", "MAX_CORRELATION_ID_LENGTH"):
             self.assertEqual(getattr(bus, name), getattr(event_validation, name))
         self.assertTrue(issubclass(event_validation.EventValidationError, ValueError))
+
+    def test_every_built_in_topic_has_exactly_one_payload_validator(self):
+        # A topic added to KNOWN_TOPICS without a validator would otherwise be
+        # accepted with only a task_id check.
+        payload_topics = set(event_validation._PAYLOAD_VALIDATORS)
+        task_topics = set(event_validation._TASK_VALIDATORS)
+        self.assertEqual(set(), payload_topics & task_topics)
+        self.assertEqual(set(event_validation.KNOWN_TOPICS) - set(event_validation.TELEMETRY_TOPICS),
+                         payload_topics | task_topics)
 
     def test_valid_payloads_are_checked_without_normalizing_or_mutating_them(self):
         payload = {"title": " demo ", "depends_on": [1, 2], "context": {"nested": [1, 2]},

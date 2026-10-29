@@ -25,49 +25,21 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-# Re-export the existing validator, exception, constants, and helpers so
-# callers importing them from logplane.bus keep the same entry points.
+# The validator and its exception stay importable from logplane.bus, which is
+# where callers found them before validation moved to its own module.
 from logplane.event_validation import (
     CURRENT_SCHEMA_VERSION,
     MAX_CORRELATION_ID_LENGTH,
-    MAX_PRODUCER_FIELD_LENGTH,
     EventValidationError,
-    _is_positive_int,
     _is_nonnegative_int,
-    _is_positive_number,
     _is_nonnegative_number,
-    _require_string,
-    _require_task_id,
-    _validate_json_object,
-    _validate_decisions,
-    _validate_task_dependencies,
-    _validate_task_scheduling,
-    _validate_control_attempt,
-    _validate_dependency_refs,
-    _validate_capabilities,
-    _validate_retry_policy,
-    _validate_external_origin,
-    _validate_ownership,
+    _is_positive_int,
     _validate_correlation_id,
-    _validate_producer,
-    _validate_artifact_refs,
-    _validate_telemetry,
-    _require_telemetry_string,
     validate_event,
 )
 
 from logplane.legacy import check_legacy_environment
-from logplane.limits import (
-    MAX_ARTIFACT_BYTES,
-    MAX_TELEMETRY_ARTIFACT_REFS,
-    MAX_TELEMETRY_OBJECT_BYTES,
-    MAX_EXTERNAL_ID_LENGTH,
-    MAX_INLINE_CONTEXT_BYTES,
-    MAX_INLINE_RESULT_BYTES,
-    MAX_TASK_DEPENDENCIES,
-)
-from logplane.scheduling import DEFAULT_TASK_PRIORITY, validate_task_priority
-from logplane.topics import KNOWN_TOPICS, TELEMETRY_TOPICS
+from logplane.scheduling import DEFAULT_TASK_PRIORITY
 from logplane.version import VERSION
 
 DB_PATH = Path(os.environ.get("LOGPLANE_DB_PATH", Path.cwd() / "events.db"))
