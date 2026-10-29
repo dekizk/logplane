@@ -740,6 +740,9 @@ class BusApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(422, invalid.status_code)
+        self.assertEqual(
+            {"detail": "payload.assignment_id must be a non-empty string"}, invalid.json()
+        )
 
         conflict = self.client.post(
             "/events",
@@ -758,6 +761,14 @@ class BusApiTests(unittest.TestCase):
         fetched = self.client.get(f"/events/{created.json()['id']}")
         self.assertEqual(created.json(), fetched.json())
         self.assertEqual(404, self.client.get("/events/999").status_code)
+
+    def test_query_validation_still_translates_errors_to_http_422(self):
+        for route in ("/events", "/events/stream"):
+            with self.subTest(route=route):
+                response = self.client.get(route, params={"correlation_id": " flow "})
+                self.assertEqual(422, response.status_code)
+                self.assertEqual({"detail": "correlation_id must be null or a trimmed, "
+                                  "non-empty string of at most 128 characters"}, response.json())
 
     def test_correlation_propagation_validation_and_query(self):
         root = self.client.post(

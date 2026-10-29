@@ -1,5 +1,12 @@
 # Release notes
 
+## Unreleased
+
+- **Separate pure event validation from the bus.** Envelope and payload rules
+  now live in `event_validation.py`; database reference checks and HTTP error
+  handling remain in `bus.py`. Existing bus-level validation imports, accepted
+  payloads, validation order, and error messages are unchanged.
+
 ## v0.14.1 — 2026-10-26
 
 Hardening from an external review of v0.14.0. No event, executor-wire,
