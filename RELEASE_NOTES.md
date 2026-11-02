@@ -1,5 +1,18 @@
 # Release notes
 
+## Unreleased
+
+- **Event validation moves out of the bus and into one function per topic.**
+  Envelope and payload rules now live in `event_validation.py`, with no
+  database or HTTP dependencies; reference checks against stored history and
+  HTTP error handling stay in `bus.py`. The 559-line `validate_event` is now a
+  short dispatcher over per-topic validators, and a test fails if a built-in
+  topic has no validator. Accepted payloads, validation order, and error
+  messages are unchanged: an old-versus-new comparison over 68,251 recorded and
+  mutated events found no difference. `logplane.bus` still exposes
+  `validate_event` and `EventValidationError`; limits and topic constants
+  should be imported from `logplane.limits` and `logplane.topics`.
+
 ## v0.14.1 — 2026-10-26
 
 Hardening from an external review of v0.14.0. No event, executor-wire,

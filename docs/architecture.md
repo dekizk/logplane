@@ -85,7 +85,8 @@ two rows are runtime data in the directory where you run logplane.
 
 | File | Role |
 |---|---|
-| `bus.py` | FastAPI, SQLite event storage, validation, queries, and SSE streaming |
+| `bus.py` | FastAPI, SQLite event storage, transactional reference checks, queries, and SSE streaming |
+| `event_validation.py` | Pure event-envelope and payload validation; no database or HTTP dependencies |
 | `client.py` | Publish, bounded history reads, reconnecting subscriptions, durable offsets |
 | `projection.py` | Pure coordination reducer shared by the PM and operator tools |
 | `pm_agent.py` | Deterministic post-replay reconciliation and single-PM runtime |
@@ -109,6 +110,11 @@ two rows are runtime data in the directory where you run logplane.
 | `demo.py` | Scripted `logplane demo` scenarios with real processes in a throwaway directory |
 | `.logplane/events.db` | Append-only event log and task-id counter (path set in `logplane.local.json`) |
 | `.offsets/` | Optional durable resume points for stable consumer identities |
+
+`bus.py` delegates envelope and payload checks to `event_validation.py` and
+retains checks that need stored history, such as referenced events and
+idempotency claims. HTTP error translation also stays in the bus. Existing
+`bus.validate_event` and `bus.EventValidationError` imports remain available.
 
 ## Architecture and invariants
 
