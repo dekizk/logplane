@@ -605,10 +605,10 @@ def apply_event(state: PMState, ev: dict) -> bool:
             return False
         if task.status_event_id is not None and event_id <= task.status_event_id:
             return False
-        handler = _TASK_HANDLERS.get(topic)
-        if handler is None:
+        task_handler = _TASK_HANDLERS.get(topic)
+        if task_handler is None:
             return False
-        return handler(state, ev, payload, event_id, timestamp, task_id, task)
+        return task_handler(state, ev, payload, event_id, timestamp, task_id, task)
     except (KeyError, OverflowError, TypeError, ValueError):
         return False
 
@@ -2076,10 +2076,16 @@ def _apply_workflow_resumed(
     return True
 
 
-Handler = Callable[..., bool]
+# One signature per table, so a handler registered in the wrong table is a type
+# error rather than a TypeError that apply_event would swallow as a rejection.
+AgentHandler = Callable[[PMState, dict, dict, int, float], bool]
+WorkflowHandler = Callable[
+    [PMState, dict, dict, int, float, str, WorkflowControlRecord, object], bool
+]
+TaskHandler = Callable[[PMState, dict, dict, int, float, int, TaskRecord], bool]
 
 # Events about agents, and usage accounting, need no task lookup.
-_AGENT_AND_USAGE_HANDLERS: dict[str, Handler] = {
+_AGENT_AND_USAGE_HANDLERS: dict[str, AgentHandler] = {
     "agent.registered": _apply_agent_registered,
     "agent.heartbeat": _apply_agent_heartbeat,
     "agent.policy_set": _apply_agent_policy_set,
@@ -2087,7 +2093,7 @@ _AGENT_AND_USAGE_HANDLERS: dict[str, Handler] = {
 }
 
 # Workflow control and policy events, after _apply_workflow_control's checks.
-_WORKFLOW_HANDLERS: dict[str, Handler] = {
+_WORKFLOW_HANDLERS: dict[str, WorkflowHandler] = {
     "workflow.policy_set": _apply_workflow_policy_set,
     "workflow.pause_requested": _apply_workflow_pause_requested,
     "workflow.paused": _apply_workflow_paused,
@@ -2096,7 +2102,7 @@ _WORKFLOW_HANDLERS: dict[str, Handler] = {
 }
 
 # Events about one existing task, after the lookup and stale-event check.
-_TASK_HANDLERS: dict[str, Handler] = {
+_TASK_HANDLERS: dict[str, TaskHandler] = {
     "task.cancel_requested": _apply_task_cancel_requested,
     "task.pause_requested": _apply_task_pause_requested,
     "task.paused": _apply_task_paused,
