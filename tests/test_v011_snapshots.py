@@ -124,6 +124,19 @@ class SnapshotTests(unittest.TestCase):
             function.__defaults__ = original
         self.assertEqual(before, fingerprint())
 
+    def test_fingerprint_changes_when_a_topic_is_routed_to_another_handler(self):
+        from logplane import projection, projection_store
+
+        fingerprint = projection_store.reducer_fingerprint.__wrapped__  # bypass the cache
+        before = fingerprint()
+        original = projection._TASK_HANDLERS["task.paused"]
+        try:
+            projection._TASK_HANDLERS["task.paused"] = projection._TASK_HANDLERS["task.resumed"]
+            self.assertNotEqual(before, fingerprint())
+        finally:
+            projection._TASK_HANDLERS["task.paused"] = original
+        self.assertEqual(before, fingerprint())
+
     def test_fingerprint_is_stable_across_processes(self):
         script = "from logplane.projection_store import reducer_fingerprint; print(reducer_fingerprint())"
         values = {subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,

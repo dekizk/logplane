@@ -51,6 +51,16 @@ def reducer_fingerprint() -> str:
                         digest.update(f"{name}.{method}".encode())
                         digest.update(json.dumps(_code_identity(function.__code__), sort_keys=True).encode())
                         digest.update(_defaults_identity(function).encode())
+            elif (
+                isinstance(value, dict)
+                and value
+                and all(inspect.isfunction(item) for item in value.values())
+            ):
+                # Dispatch tables: which topic runs which handler is part of the
+                # reducer, even though each handler's code is hashed on its own.
+                digest.update(name.encode())
+                for key, function in sorted(value.items()):
+                    digest.update(f"{key}={function.__module__}.{function.__qualname__}".encode())
             elif name.isupper() and isinstance(value, (str, int, float, tuple, frozenset, list, set, dict)):
                 # Canonicalize policy/topic constants, including unordered sets.
                 try:
