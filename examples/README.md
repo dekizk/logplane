@@ -25,5 +25,6 @@ Copyable examples:
   cap, and idempotent filing through a Python agent.
 - [`audit_triage/`](audit_triage/) explains the `logplane demo audit-triage`
   pipeline and how to swap its stand-in stages for real agents.
-- [`openclaw/`](openclaw/) is a tool-free pilot using OpenClaw's one-shot CLI,
-  with a recorded real task through Nous Portal and a disposable live bus.
+- [`openclaw/`](openclaw/) runs OpenClaw as a tool-free worker: one task, a Hermes ->
+  OpenClaw handoff, and a trial that crashes and freezes workers mid-task, each
+  through a disposable live bus.

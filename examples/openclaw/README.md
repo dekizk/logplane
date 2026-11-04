@@ -107,6 +107,41 @@ trial collects usage as sidecar evidence only, without telemetry sinks for
 either worker: zero/missing costs in the workflow view are **not** evidence
 that model calls were free.
 
+## Interrupt it: a crashed worker and a frozen one
+
+The handoff above runs both workers as threads in one process. This trial runs
+every worker as its own process and interrupts OpenClaw twice. With the same
+subscription proxy running:
+
+```sh
+.venv/bin/python -m examples.openclaw.interruption_trial --yes \
+  --openclaw-command "$HOME/.openclaw/bin/openclaw"
+```
+
+It takes about a minute and approves one Hermes call and up to three OpenClaw
+calls; the first OpenClaw call is cut short. What happens:
+
+1. Hermes completes task 1. OpenClaw worker **A** takes task 2 (attempt 1) and
+   is killed mid-task (`kill -9`), together with the agent process it started.
+   Nothing tells Logplane; A's lease stops being renewed and expires.
+2. Worker **B** gets attempt 2 and is frozen mid-task (`SIGSTOP`). Its agent
+   keeps running, but B cannot report or send heartbeats, so its lease expires.
+3. Worker **C** gets attempt 3 and finishes the task.
+4. B is resumed, holding a late result for an attempt it no longer owns. Its
+   runtime discards that result, or cancels its adapter first; which one happens
+   is a race, and the trial records which.
+5. A labelled probe then sends attempt 2's completion exactly as a buggy or
+   cut-off worker would. The log keeps it; replay must ignore it.
+
+Thirteen checks cover expiry of both attempts, the same resolved dependency
+reaching every attempt, B's adapter returning only after its lease expired, and
+only C's result being accepted. The evidence directory holds `events.json`,
+`summary.json`, each OpenClaw worker's record of what its adapter received and
+returned (`records/`), the `logplane task` and `logplane doctor` views, and
+service logs. `--lease-seconds` (default 10) and `--hold-seconds` (default 2,
+how long after a start to interrupt) tune the timing. The same trial runs with
+stand-in agents, and no model calls, in `tests/test_interruption_trial.py`.
+
 ## Boundaries and evidence
 
 - A pinned config avoids ambient tool/plugin configuration. There is no Gateway,
