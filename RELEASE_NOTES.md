@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **New example: OpenClaw as a Logplane worker, and a Hermes → OpenClaw
+  handoff.** `examples/openclaw/` runs OpenClaw's one-shot `agent exec` once per
+  assignment, with every tool denied and plugins disabled. `mixed_trial.py` runs
+  a real two-agent workflow: Hermes produces a result, and OpenClaw, starting
+  from an empty context, receives it as a resolved dependency and builds on it.
+  The live run passed all 13 checks on the first attempt for each task. Nothing
+  in Logplane's core changed. See `examples/openclaw/TRIAL_NOTES.md` for the
+  recorded runs and what they do not yet show (interruption and recovery,
+  OpenClaw usage in Logplane's budget accounting, tool-enabled editing).
 - **CI now runs Ruff and mypy.** A new lint-and-type-check job runs on every
   pull request and push to `main`, and publishing to PyPI waits for it. Both
   tools are pinned in `requirements-lint.txt` and configured in
