@@ -169,3 +169,67 @@ production integration guarantee from this small, successful DAG.
   one existing dependency warning; Ruff and configured mypy checks pass.
 
 Still on `feat/openclaw-worker-trial`; not committed or pushed by this trial.
+
+## 2026-11-04 — interruption trial: a crashed worker and a frozen one
+
+Result: **passed all 13 checks**. Both agents used GPT-6 Luna/high through
+Nous Portal; every worker ran as its own process; lease 10 s, heartbeat 2.5 s.
+No core Logplane modules changed.
+
+| Time | Event | What happened |
+|---|---|---|
+| +0.7 s | #8, #9 | Hermes assigned and started task 1 |
+| +9.3 s | #19, #20 | Hermes completed; task 2 attempt 1 assigned to `openclaw-a` |
+| +11.6 s | — | `openclaw-a` killed (`kill -9`) with its 1 OpenClaw process |
+| +20.9 s | #28 | Attempt 1 expired: worker lease expired |
+| +21.1 s | #31 | Attempt 2 assigned to `openclaw-b` |
+| +23.4 s | — | `openclaw-b` frozen (`SIGSTOP`); its OpenClaw process kept running |
+| +33.6 s | #38 | Attempt 2 expired: worker lease expired |
+| +34.0 s | #41 | Attempt 3 assigned to `openclaw-c` |
+| +42.4 s | #49 | `openclaw-c` completed; this is the accepted result |
+| +42.6 s | — | `openclaw-b` resumed; its adapter returned a **completed** result |
+| +47.8 s | #57 | Probe: attempt 2's completion sent as `openclaw-b` |
+
+The frozen worker held a genuine late result. Its OpenClaw call finished while
+the worker was frozen, and the adapter returned a correct completed outcome 9.04
+seconds after Logplane had expired that attempt. The worker runtime discarded
+it and published nothing. (In stand-in runs the runtime sometimes cancels the
+adapter first instead; both are correct.) The only attempt-2 completion in the
+log is the labelled probe, #57, which replay ignored. `logplane doctor`
+reported 1 stale worker (the killed one) and "1 historical event(s) were safely
+ignored as stale or invalid".
+
+All three attempts received the same resolved dependency, from completion
+event #19, with an empty context. The accepted result was:
+
+```json
+{
+  "handoff_marker": "df0f2cc4416548dcaaae62f7cb8c6f63",
+  "total": 51,
+  "source_task_id": 1,
+  "source_completion_event_id": 19
+}
+```
+
+The task view shows 3 attempts, 2 retryable failures (the two expiries), 0
+retries remaining, and the last attempt on `openclaw-c`. There were no other
+failure events, no tracebacks in any service log, and every agent workspace was
+empty afterwards.
+
+Usage: Hermes reported 1,447 input and 75 output tokens, estimated at
+$0.0002183. OpenClaw's usage was not captured in this run: the worker record
+did not yet save OpenClaw's report. It does now, under `openclaw_report` in
+`records/`. Three OpenClaw calls were made; the first was cut off by the crash.
+
+The evidence is kept locally, outside the repository: events, summary with all
+13 check results, each worker's adapter record, the task and doctor views, and
+service logs.
+
+### What this shows, and what it does not
+
+- Shown: lease expiry after a real crash and a real hang; retry to a different
+  worker; dependency results surviving retries; a real late result discarded
+  by the worker runtime; a stale report in the log ignored by replay.
+- Not shown: restarting the coordinator itself during the trial (covered by
+  `logplane demo recovery` with stand-in workers); OpenClaw usage in Logplane
+  telemetry and budget accounting; tool-enabled editing.

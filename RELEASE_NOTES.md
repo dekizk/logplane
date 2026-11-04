@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **New example: an interruption trial across Hermes and OpenClaw.**
+  `examples/openclaw/interruption_trial.py` runs each worker as its own process.
+  It kills one OpenClaw worker mid-task, freezes a second past its lease, and
+  checks three things: Logplane expires both attempts, every attempt receives
+  the same dependency, and only the third attempt's result is accepted. A
+  labelled probe then sends the frozen attempt's stale completion, which replay
+  must ignore. The OpenClaw worker launcher gains `--name`,
+  `--heartbeat-seconds` and `--record`. The trial runs with stand-in agents in
+  the test suite, so it needs no model calls there.
 - **New example: OpenClaw as a Logplane worker, and a Hermes → OpenClaw
   handoff.** `examples/openclaw/` runs OpenClaw's one-shot `agent exec` once per
   assignment, with every tool denied and plugins disabled. `mixed_trial.py` runs
