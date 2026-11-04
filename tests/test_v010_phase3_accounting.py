@@ -11,7 +11,7 @@ from logplane import bus
 from logplane.client import BusClient
 from logplane.executors import AssignmentContext
 from logplane.local_config import LocalConfig, initialize_local_config
-from logplane.operations import explain_task, worker_views, workflow_view
+from logplane.operations import explain_task, worker_views
 from logplane.pm_agent import (
     OrderedProjectionCursor,
     PM_TOPICS,
@@ -103,7 +103,7 @@ class Phase3CAccountingTests(unittest.TestCase):
 
     def test_reported_usage_releases_reserve_and_missing_usage_keeps_it(self):
         worker = self._register(capacity=1)
-        first = self._create("budget-flow", "first")
+        self._create("budget-flow", "first")
         second = self._create("budget-flow", "second")
         third = self._create("budget-flow", "third")
         self._budget_policy("budget-flow", tokens=100, reserve_tokens=60)

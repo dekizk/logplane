@@ -50,3 +50,25 @@ version = {attr = "logplane.version.VERSION"}
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness checks only (syntax errors, undefined or unused names). Style and
+# formatting rules are deliberately not enabled.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.10"
+# Start with the modules that define and replay the event log. Imported
+# modules are analysed for their types but their own errors are not reported;
+# add modules here as they are brought up to the same standard.
+files = [
+    "src/logplane/projection.py",
+    "src/logplane/event_validation.py",
+    "src/logplane/bus.py",
+]
+mypy_path = "src"
+follow_imports = "silent"
+warn_unused_ignores = true

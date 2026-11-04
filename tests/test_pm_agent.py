@@ -6,7 +6,6 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from logplane import bus
 from logplane import pm_agent
 from logplane.pm_agent import PMState, apply_event, plan_next_emission, reconcile
 from logplane.topics import COORDINATION_TOPICS, INTEGRATION_TOPICS, KNOWN_TOPICS, TELEMETRY_TOPICS

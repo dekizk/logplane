@@ -348,6 +348,14 @@ python -m pytest -q
 python -m build
 ```
 
+CI also runs Ruff and mypy at pinned versions, configured in `pyproject.toml`:
+
+```sh
+python -m pip install -r requirements-lint.txt
+ruff check .
+mypy
+```
+
 The suite focuses on orchestration failures (restarts, stale attempts, retry
 exhaustion, races, DAG propagation, adapter contracts, telemetry isolation)
 and includes live runs of every demo. See

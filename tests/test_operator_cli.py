@@ -239,4 +239,5 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(json.loads(out.getvalue())['accepted'])
 
 
-if __name__ == '__main__':unittest.main()
+if __name__ == '__main__':
+    unittest.main()

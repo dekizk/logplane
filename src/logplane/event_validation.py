@@ -7,7 +7,7 @@ validation order and error messages stable when changing these contracts.
 
 import json
 import math
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, TypeGuard
 
 from logplane.limits import (
     MAX_ARTIFACT_BYTES,
@@ -34,7 +34,7 @@ def _is_positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _is_nonnegative_int(value: object) -> bool:
+def _is_nonnegative_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 

@@ -1,6 +1,6 @@
 include COMPATIBILITY.md RECOVERY.md RELEASE_NOTES.md ROADMAP.md
 include LICENSE CONTRIBUTORS.md
-include requirements.txt requirements-dev.txt
+include requirements.txt requirements-dev.txt requirements-lint.txt
 recursive-include benchmarks *.py *.md
 recursive-include scripts *.py
 recursive-include ci *.txt

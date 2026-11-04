@@ -5,7 +5,7 @@ from pathlib import Path
 from logplane import bus
 from logplane.operations import explain_task, task_view, workflow_view
 from logplane.pm_agent import OrderedProjectionCursor, PM_TOPICS, PMState, reconcile
-from logplane.projection import apply_event, replay_events
+from logplane.projection import replay_events
 
 
 class DirectPMBus:
