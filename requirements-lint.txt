@@ -1,0 +1,4 @@
+# Pinned so a new linter or type-checker release cannot fail CI on its own.
+# Bump these deliberately, together with any fixes the new versions need.
+ruff==0.17.3
+mypy==2.4.1

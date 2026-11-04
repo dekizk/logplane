@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **CI now runs Ruff and mypy.** A new lint-and-type-check job runs on every
+  pull request and push to `main`, and publishing to PyPI waits for it. Both
+  tools are pinned in `requirements-lint.txt` and configured in
+  `pyproject.toml`. Ruff checks for correctness only (undefined or unused names,
+  syntax), not style. mypy covers `projection`, `event_validation` and `bus` to
+  start with. Fixing its 14 findings changed no behaviour: replaying the
+  recorded test-suite events, plus 157,642 single-field and 46,440 multi-field
+  variants, through the reducer before and after found no difference.
 - **Event validation moves out of the bus and into one function per topic.**
   Envelope and payload rules now live in `event_validation.py`, with no
   database or HTTP dependencies; reference checks against stored history and

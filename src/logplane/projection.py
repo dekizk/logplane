@@ -275,7 +275,7 @@ class PMState:
             if record.correlation_id == correlation_id
         ]
 
-    def workflow_budget_usage(self, correlation_id: Optional[str]) -> dict[str, object]:
+    def workflow_budget_usage(self, correlation_id: Optional[str]) -> dict[str, int | float]:
         records = self.workflow_accounting(correlation_id)
         return {
             "tokens": sum(record.charged_tokens() for record in records),
@@ -1802,74 +1802,57 @@ def _apply_workflow_policy_set(
         or not reason.strip()
     ):
         return False
-    effective = {
+    # Start from the current policy; fields present in the payload replace it.
+    # None in the payload clears a limit; any other invalid value rejects.
+    integer_limits: dict[str, Optional[int]] = {
         "max_active_assignments": control.max_active_assignments,
         "max_total_tokens": control.max_total_tokens,
-        "max_total_cost_usd": control.max_total_cost_usd,
         "max_attempts": control.max_attempts,
+    }
+    number_limits: dict[str, Optional[float]] = {
+        "max_total_cost_usd": control.max_total_cost_usd,
         "max_wall_clock_seconds": control.max_wall_clock_seconds,
-        "reserve_tokens_per_assignment": (
-            control.reserve_tokens_per_assignment
-        ),
-        "reserve_cost_usd_per_assignment": (
-            control.reserve_cost_usd_per_assignment
-        ),
     }
-    integer_limits = {
-        "max_active_assignments",
-        "max_total_tokens",
-        "max_attempts",
-    }
-    number_limits = {
-        "max_total_cost_usd",
-        "max_wall_clock_seconds",
-    }
+    reserve_tokens = control.reserve_tokens_per_assignment
+    reserve_cost = control.reserve_cost_usd_per_assignment
     for field_name in integer_limits:
         if field_name not in payload:
             continue
         raw_value = payload[field_name]
-        parsed = None if raw_value is None else _positive_int(raw_value)
-        if raw_value is not None and parsed is None:
+        parsed_int = None if raw_value is None else _positive_int(raw_value)
+        if raw_value is not None and parsed_int is None:
             return False
-        effective[field_name] = parsed
+        integer_limits[field_name] = parsed_int
     for field_name in number_limits:
         if field_name not in payload:
             continue
         raw_value = payload[field_name]
-        parsed = None if raw_value is None else _positive_number(raw_value)
-        if raw_value is not None and parsed is None:
+        parsed_number = None if raw_value is None else _positive_number(raw_value)
+        if raw_value is not None and parsed_number is None:
             return False
-        effective[field_name] = parsed
+        number_limits[field_name] = parsed_number
     if "reserve_tokens_per_assignment" in payload:
         parsed_tokens = _nonnegative_int(
             payload["reserve_tokens_per_assignment"]
         )
         if parsed_tokens is None:
             return False
-        effective["reserve_tokens_per_assignment"] = parsed_tokens
+        reserve_tokens = parsed_tokens
     if "reserve_cost_usd_per_assignment" in payload:
         parsed_cost = _nonnegative_number(
             payload["reserve_cost_usd_per_assignment"]
         )
         if parsed_cost is None:
             return False
-        effective["reserve_cost_usd_per_assignment"] = parsed_cost
-    if (
-        effective["max_total_tokens"] is not None
-        and (
-            effective["reserve_tokens_per_assignment"] <= 0
-            or effective["reserve_tokens_per_assignment"]
-            > effective["max_total_tokens"]
-        )
+        reserve_cost = parsed_cost
+    max_total_tokens = integer_limits["max_total_tokens"]
+    if max_total_tokens is not None and (
+        reserve_tokens <= 0 or reserve_tokens > max_total_tokens
     ):
         return False
-    if (
-        effective["max_total_cost_usd"] is not None
-        and (
-            effective["reserve_cost_usd_per_assignment"] <= 0
-            or effective["reserve_cost_usd_per_assignment"]
-            > effective["max_total_cost_usd"]
-        )
+    max_total_cost_usd = number_limits["max_total_cost_usd"]
+    if max_total_cost_usd is not None and (
+        reserve_cost <= 0 or reserve_cost > max_total_cost_usd
     ):
         return False
     if source == "default":
@@ -1891,21 +1874,13 @@ def _apply_workflow_policy_set(
     control.policy_actor = ev.get("actor")
     control.policy_source = source
     control.policy_reason = reason
-    control.max_active_assignments = effective[
-        "max_active_assignments"
-    ]
-    control.max_total_tokens = effective["max_total_tokens"]
-    control.max_total_cost_usd = effective["max_total_cost_usd"]
-    control.max_attempts = effective["max_attempts"]
-    control.max_wall_clock_seconds = effective[
-        "max_wall_clock_seconds"
-    ]
-    control.reserve_tokens_per_assignment = effective[
-        "reserve_tokens_per_assignment"
-    ]
-    control.reserve_cost_usd_per_assignment = effective[
-        "reserve_cost_usd_per_assignment"
-    ]
+    control.max_active_assignments = integer_limits["max_active_assignments"]
+    control.max_total_tokens = max_total_tokens
+    control.max_total_cost_usd = max_total_cost_usd
+    control.max_attempts = integer_limits["max_attempts"]
+    control.max_wall_clock_seconds = number_limits["max_wall_clock_seconds"]
+    control.reserve_tokens_per_assignment = reserve_tokens
+    control.reserve_cost_usd_per_assignment = reserve_cost
     control.latest_event_id = event_id
     return True
 
@@ -1984,12 +1959,12 @@ def _apply_workflow_paused(
     ):
         return False
     interrupted = []
-    for item in expected:
-        task = state.tasks.get(item["task_id"])
+    for task_id, assignment_id in control.pause_assignment_snapshot:
+        task = state.tasks.get(task_id)
         if (
             task is None
             or task.status not in ACTIVE_TASK_STATUSES
-            or task.assignment_id != item["assignment_id"]
+            or task.assignment_id != assignment_id
         ):
             # Cancellation, deadline, task pause, or supersession
             # has stronger authority. The workflow acknowledgement

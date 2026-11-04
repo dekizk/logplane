@@ -144,7 +144,7 @@ class RuntimeOutcomeTests(RuntimeTestCase):
                 )
                 final = bus.published[-1]
                 self.assertEqual(
-                    f"task:1:attempt:1",
+                    "task:1:attempt:1",
                     final["payload"]["assignment_id"],
                 )
                 if isinstance(outcome, RetryableFailure):

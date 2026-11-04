@@ -25,8 +25,6 @@ from logplane.projection import (
     PMState,
     PROJECTION_TOPICS,
     TASK_TERMINAL_STATUSES,
-    TaskRecord,
-    WorkerRecord,
     apply_event,
     dependency_terminal_event_id,
     retry_budget_exhausted,

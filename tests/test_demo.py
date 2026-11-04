@@ -1,7 +1,6 @@
 """The scripted demos: stage logic in isolation, then each scenario live."""
 
 import io
-import json
 import os
 import tempfile
 import threading
