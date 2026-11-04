@@ -12,6 +12,18 @@
   mutated events found no difference. `logplane.bus` still exposes
   `validate_event` and `EventValidationError`; limits and topic constants
   should be imported from `logplane.limits` and `logplane.topics`.
+- **The coordinator's reducer is split into one handler per topic.** The
+  1,219-line `apply_event` in `projection.py` is now a short dispatcher: shared
+  checks (envelope, task lookup, stale-event guard, workflow checks) stay in one
+  place and each topic has its own `_apply_<topic>` function. Behaviour is
+  unchanged: replaying 24,523 events recorded from the test suite, plus 176,836
+  mutated variants, through the old and new reducers found no difference in
+  return values or resulting state, and the comparison caught all five
+  deliberately broken versions it was checked against.
+- **Snapshot fingerprints now cover topic-to-handler routing.** Pointing a topic
+  at a different handler now invalidates saved PM snapshots, as changing a
+  handler's code already did. Because the reducer's code changed, existing PM
+  snapshots are rebuilt from the log once on first start; no data is lost.
 
 ## v0.14.1 — 2026-10-26
 
