@@ -1,0 +1,24 @@
+{
+  "plugins": {"enabled": false},
+  "skills": {"allowBundled": []},
+  "tools": {"profile": "minimal", "deny": ["*"]},
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "nousportal": {
+        "baseUrl": "http://127.0.0.1:18645/v1",
+        "apiKey": "unused-local-proxy",
+        "api": "openai-completions",
+        "agentRuntime": {"id": "openclaw"},
+        "models": [{
+          "id": "openai/gpt-6-luna",
+          "name": "GPT 6 Luna via Nous Portal",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 2048
+        }]
+      }
+    }
+  }
+}
