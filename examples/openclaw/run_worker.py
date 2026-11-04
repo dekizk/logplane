@@ -47,8 +47,13 @@ class RecordingExecutor:
     def execute(self, assignment):
         self._append({"event": "received", "assignment": assignment.to_dict()})
         outcome = self.delegate.execute(assignment)
-        self._append({"event": "returned", "assignment_id": assignment.assignment_id,
-                      "outcome": outcome_record(outcome)})
+        entry = {"event": "returned", "assignment_id": assignment.assignment_id,
+                 "outcome": outcome_record(outcome)}
+        # OpenClaw-reported usage and cost, kept apart from the agent's result.
+        report = getattr(self.delegate, "last_report", None)
+        if report and report[0] == assignment.assignment_id:
+            entry["openclaw_report"] = report[1]
+        self._append(entry)
         return outcome
 
     def cancel(self, assignment_id):

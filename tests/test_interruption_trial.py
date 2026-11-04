@@ -25,7 +25,7 @@ dep = assignment["dependencies"][0]
 result = {"handoff_marker": dep["result"]["handoff_marker"], "total": sum(dep["result"]["numbers"]),
           "source_task_id": dep["task_id"], "source_completion_event_id": dep["completion_event_id"]}
 final = {"status": "completed", "summary": "Combined the upstream result.", "result": result}
-print(json.dumps({"ok": True, "status": "ok", "final": json.dumps(final)}))
+print(json.dumps({"ok": True, "status": "ok", "final": json.dumps(final), "usage": {"total": 7}}))
 '''
 
 FAKE_HERMES = '''
@@ -83,6 +83,8 @@ class InterruptionTrialTests(unittest.TestCase):
         self.assertTrue(self.summary["passed"], self.summary.get("checks"))
         self.assertTrue(all(self.verify().values()))
         self.assertEqual(1, self.summary["facts"]["replay_ignored_events"])
+        finished = next(r for r in self.records["openclaw-c"] if r["event"] == "returned")
+        self.assertEqual({"total": 7}, finished["openclaw_report"]["usage"])
         doctor = (self.evidence / "view-doctor.txt").read_text()
         self.assertIn("1 historical event(s) were safely ignored", doctor)
 

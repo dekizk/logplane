@@ -137,7 +137,7 @@ Thirteen checks cover expiry of both attempts, the same resolved dependency
 reaching every attempt, B's adapter returning only after its lease expired, and
 only C's result being accepted. The evidence directory holds `events.json`,
 `summary.json`, each OpenClaw worker's record of what its adapter received and
-returned (`records/`), the `logplane task` and `logplane doctor` views, and
+returned, with OpenClaw-reported usage (`records/`), the `logplane task` and `logplane doctor` views, and
 service logs. `--lease-seconds` (default 10) and `--hold-seconds` (default 2,
 how long after a start to interrupt) tune the timing. The same trial runs with
 stand-in agents, and no model calls, in `tests/test_interruption_trial.py`.
