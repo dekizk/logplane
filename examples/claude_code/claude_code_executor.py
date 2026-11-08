@@ -5,12 +5,17 @@ Two ways to authenticate, chosen explicitly:
 - ``login``: your normal Claude Code login (for example a subscription). Runs
   with ``--safe-mode`` unless you opt in to your customizations, so user hooks,
   plugins, skills, CLAUDE.md and auto memory do not load. Only user-level
-  settings load (``--setting-sources user``). Environment variables that would
-  switch authentication or provider are removed, and ``claude auth status`` must
-  report a Claude login before the worker accepts work.
+  settings load (``--setting-sources user``). ``claude auth status`` must report
+  a Claude login, checked against those same settings, before the worker
+  accepts work.
 - ``api-key``: ``claude --bare`` with ``ANTHROPIC_API_KEY`` from the environment.
   Bare mode skips hooks, plugins, skills, MCP servers, auto memory and
   CLAUDE.md, so every machine gets the same run.
+
+In both modes, environment variables that would switch authentication or
+provider are removed (their names are reported, never their values), and every
+run must report the expected credential source in its own init message, or its
+outcome is discarded.
 
 Either way, built-in tools are off unless ``read_only_tools`` is set, MCP tools
 and slash commands are disabled, anything that would need approval is denied,
@@ -43,29 +48,56 @@ from logplane.limits import MAX_INLINE_RESULT_BYTES
 AUTH_MODES = ("login", "api-key")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 READ_ONLY_TOOLS = "Read,Grep,Glob"
-MAX_OUTPUT_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024  # the stream includes any files Claude reads
 MAX_PROMPT_BYTES = 48 * 1024
 MAX_REASON_CHARS = 300
 LOGIN_AUTH_METHODS = ("claude.ai", "oauth_token")
 MAX_SCANNED_ENTRIES = 500_000
 
 
-def _switches_auth_or_provider(name: str) -> bool:
-    """Variables that would make a login-mode run authenticate some other way.
+LOGIN_TOKEN_VARIABLES = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+                         "CLAUDE_CODE_OAUTH_SCOPES")
+# What each run's init message must report as its credential source.
+EXPECTED_KEY_SOURCE = {"login": "none", "api-key": "ANTHROPIC_API_KEY"}
+# Tools that act on the machine or the network. None is ever granted; a run
+# that reports one anyway is discarded.
+FORBIDDEN_TOOLS = frozenset({
+    "Bash", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write", "NotebookEdit",
+    "WebFetch", "WebSearch", "Agent", "Task",
+})
+
+
+def conflicting_auth_variables(environment: dict, auth: str) -> list[str]:
+    """Variables that would make a run authenticate other than ``auth`` says.
 
     Covers API keys and tokens, gateways and base URLs, profiles and workload
-    identity federation (all ANTHROPIC_*), and the Bedrock, Google Cloud and
-    Foundry provider switches (CLAUDE_CODE_USE_*). The Claude login's own
-    CLAUDE_CODE_OAUTH_TOKEN is kept.
+    identity federation (all ANTHROPIC_*), the Bedrock, Google Cloud and
+    Foundry provider switches (CLAUDE_CODE_USE_*) and Bedrock's own key.
+    Login mode keeps the Claude login's own token variables; api-key mode keeps
+    only ANTHROPIC_API_KEY and drops the login tokens as well.
     """
-    return name.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")) or name == "AWS_BEARER_TOKEN_BEDROCK"
+    def conflicts(name: str) -> bool:
+        if auth == "api-key" and name == "ANTHROPIC_API_KEY":
+            return False
+        if name.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")) or name == "AWS_BEARER_TOKEN_BEDROCK":
+            return True
+        return auth == "api-key" and name in LOGIN_TOKEN_VARIABLES
+    return sorted(name for name in environment if conflicts(name))
 
 
 def check_auth_status(command: tuple[str, ...], environment: dict) -> str:
-    """Ask Claude Code which authentication it would use; return the method."""
+    """Ask Claude Code which authentication a worker run would use.
+
+    Worker runs load only user-level settings (``--setting-sources user``), so
+    the check runs in a fresh empty directory: it then sees user and managed
+    settings only, like the worker, and no project settings from wherever the
+    launcher happens to run.
+    """
     try:
-        done = subprocess.run([*command, "auth", "status"], env=environment, capture_output=True,
-                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+        with tempfile.TemporaryDirectory(prefix="logplane-claude-auth-") as empty:
+            done = subprocess.run([*command, "auth", "status"], cwd=empty, env=environment,
+                                  capture_output=True, text=True, timeout=30,
+                                  stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"could not run `claude auth status`: {type(exc).__name__}") from exc
     try:
@@ -191,25 +223,70 @@ def _brief(text: object) -> str:
     return value[:MAX_REASON_CHARS] + ("…" if len(value) > MAX_REASON_CHARS else "")
 
 
-def parse_result(returncode: int, stdout: bytes) -> tuple[Outcome, dict]:
-    """Map Claude Code's JSON result to an outcome, plus a report kept apart from it."""
+def _stream_messages(stdout: bytes) -> tuple[Optional[dict], Optional[dict]]:
+    """The init and final result messages from stream-json output."""
+    init = result = None
+    for line in stdout.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        message = json.loads(line)
+        if not isinstance(message, dict):
+            continue
+        if message.get("type") == "system" and message.get("subtype") == "init" and init is None:
+            init = message
+        elif message.get("type") == "result":
+            result = message
+    return init, result
+
+
+def parse_result(returncode: int, stdout: bytes, *,
+                 expected_key_source: Optional[str] = None) -> tuple[Outcome, dict]:
+    """Map Claude Code's stream-json output to an outcome, plus a separate report.
+
+    The init message must report ``expected_key_source`` as its credential
+    source and no MCP or forbidden tools; otherwise the outcome is discarded.
+    """
     try:
-        envelope = json.loads(stdout)
-        if not isinstance(envelope, dict):
-            raise ValueError("not an object")
+        init, envelope = _stream_messages(stdout)
+        if envelope is None:
+            raise ValueError("no result message")
     except (ValueError, UnicodeDecodeError):
         return PermanentFailure("claude_invalid_output",
                                 "Claude Code did not print a JSON result"), {}
+    report: dict = {}
+    if init is not None:
+        tools = init.get("tools") if isinstance(init.get("tools"), list) else []
+        report.update(
+            api_key_source=init.get("apiKeySource"), tools=sorted(str(t) for t in tools),
+            init_model=init.get("model"), claude_code_version=init.get("claude_code_version"),
+            mcp_servers=len(init.get("mcp_servers") or []),
+            permission_mode=init.get("permissionMode"))
     model_usage = envelope.get("modelUsage")
-    report = {key: envelope[key] for key in (
+    report.update({key: envelope[key] for key in (
         "subtype", "is_error", "num_turns", "duration_ms", "duration_api_ms",
         "total_cost_usd", "usage",
-    ) if key in envelope}
+    ) if key in envelope})
     if isinstance(model_usage, dict):
         report["models"] = sorted(str(name) for name in model_usage)
     denials = envelope.get("permission_denials")
     if isinstance(denials, list):
         report["permission_denials"] = len(denials)
+    if expected_key_source is not None:
+        if init is None:
+            return PermanentFailure("claude_unverified_run",
+                                    "Claude Code reported no init message to verify"), report
+        if init.get("apiKeySource") != expected_key_source:
+            return PermanentFailure(
+                "claude_wrong_auth",
+                f"Claude Code used credential source {init.get('apiKeySource')!r}, "
+                f"expected {expected_key_source!r}; outcome discarded"), report
+        unexpected = sorted(t for t in report["tools"]
+                            if t.startswith("mcp__") or t in FORBIDDEN_TOOLS)
+        if unexpected:
+            return PermanentFailure(
+                "claude_unexpected_tools",
+                "Claude Code had tools it should not have: " + ", ".join(unexpected) +
+                "; outcome discarded"), report
 
     subtype = envelope.get("subtype")
     if subtype == "error_max_turns":
@@ -295,15 +372,13 @@ class ClaudeCodeExecutor:
         base = dict(os.environ if environment is None else environment)
         self.removed_variables: list[str] = []
         self.auth_method: Optional[str] = None
-        if auth == "api-key":
-            if not base.get("ANTHROPIC_API_KEY"):
-                raise ValueError("--auth api-key needs ANTHROPIC_API_KEY in the worker's environment")
-        else:
-            # Use the login, never a key, token, gateway or provider that
-            # happens to be exported. Names are reported; values never are.
-            self.removed_variables = sorted(name for name in base if _switches_auth_or_provider(name))
-            for name in self.removed_variables:
-                del base[name]
+        if auth == "api-key" and not base.get("ANTHROPIC_API_KEY"):
+            raise ValueError("--auth api-key needs ANTHROPIC_API_KEY in the worker's environment")
+        # Use exactly the chosen authentication, never a key, token, gateway or
+        # provider that happens to be exported. Names are reported; values never are.
+        self.removed_variables = conflicting_auth_variables(base, auth)
+        for name in self.removed_variables:
+            del base[name]
         self.environment = base
         self.directory = Path(working_directory).expanduser().resolve()
         if not self.directory.is_dir():
@@ -343,7 +418,7 @@ class ClaudeCodeExecutor:
         if self.auth == "api-key":
             argv.append("--bare")
         argv += ["-p", INSTRUCTION,
-                 "--output-format", "json",
+                 "--output-format", "stream-json", "--verbose",
                  "--json-schema", json.dumps(OUTCOME_SCHEMA, separators=(",", ":")),
                  "--tools", READ_ONLY_TOOLS if self.read_only_tools else "",
                  "--disallowedTools", "mcp__*",
@@ -450,7 +525,8 @@ class ClaudeCodeExecutor:
                                 return PermanentFailure("claude_output_too_large",
                                                         "Claude Code exceeded the output limit"), {}
                             output.extend(chunk)
-                return parse_result(process.returncode, bytes(output))
+                return parse_result(process.returncode, bytes(output),
+                                    expected_key_source=EXPECTED_KEY_SOURCE[self.auth])
             except OSError:
                 return RetryableFailure("claude_io_error", "Claude Code output could not be read"), {}
             finally:

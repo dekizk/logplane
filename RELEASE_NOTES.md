@@ -5,9 +5,12 @@
 - **New example: Claude Code as a Logplane worker.** `examples/claude_code/`
   runs one non-interactive `claude -p` turn per assignment. You choose how it
   authenticates. `--auth login` uses your Claude Code login in `--safe-mode`,
-  with user-level settings only. It removes every variable that would switch
-  authentication or provider, and checks `claude auth status` before accepting
-  work. `--auth api-key` runs `--bare` with `ANTHROPIC_API_KEY`. Tools are off
+  with user-level settings only, and checks `claude auth status` against those
+  same settings before accepting work. `--auth api-key` runs `--bare` with
+  `ANTHROPIC_API_KEY`. Both modes remove every variable that would switch
+  authentication or provider. Every run must report the expected credential
+  source and no unexpected tools in its init message, or its outcome is
+  discarded. Tools are off
   by default, with an optional read-only mode (Read, Grep, Glob) that refuses
   to start if user settings or symlinks would widen reads beyond the working
   directory. MCP tools and slash commands are disabled, approvals are denied,

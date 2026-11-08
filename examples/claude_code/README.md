@@ -20,26 +20,37 @@ billed differently.
 | Loads | your user-level permission settings only. `--safe-mode` keeps hooks, plugins, skills, `CLAUDE.md`, MCP servers and auto memory off; project and local settings from the working directory never load | nothing from your machine: no settings, hooks, plugins, skills, MCP servers, auto memory or `CLAUDE.md` |
 | Best for | trying it with what you already pay for | the same behaviour on every machine, CI, sharing a setup |
 
-**Login mode makes sure it is really your login.** Before accepting any work,
-the worker:
+**Both modes make sure the run uses the authentication you chose.**
 
-1. removes every variable that would switch authentication or provider from
-   Claude Code's environment: all `ANTHROPIC_*` (API keys, tokens, gateways and
-   base URLs, profiles, workload identity federation) and the Bedrock, Google
-   Cloud and Foundry switches (`CLAUDE_CODE_USE_*`). It prints the names it
-   removed, never the values. `CLAUDE_CODE_OAUTH_TOKEN`, a Claude login token,
-   is kept;
-2. runs `claude auth status` with that environment and refuses to start unless
-   it reports a Claude login (`claude.ai` or `oauth_token`). An `apiKeyHelper`
-   or credential set in your Claude Code settings is caught here.
+1. **Before any work**, the worker removes every variable that would switch
+   authentication or provider from Claude Code's environment: all
+   `ANTHROPIC_*` (keys, tokens, gateways and base URLs, profiles, workload
+   identity federation), the Bedrock, Google Cloud and Foundry switches
+   (`CLAUDE_CODE_USE_*`) and Bedrock's own key. Login mode keeps the Claude
+   login's own `CLAUDE_CODE_OAUTH_*` variables; api-key mode keeps only
+   `ANTHROPIC_API_KEY`. The worker prints the names it removed, never the
+   values.
+2. **Login mode, before any work**: the worker runs `claude auth status` and
+   refuses to start unless it reports a Claude login (`claude.ai` or
+   `oauth_token`). The check sees the same settings a worker run does: it runs
+   in an empty folder with the cleaned environment, so it reads your user and
+   managed settings, like the worker, and no project settings from the folder
+   you launched from. An `apiKeyHelper`, a credential, or a provider switch in
+   your user settings is caught here.
+3. **Every run**: Claude Code's own init message reports where its credential
+   came from. It must be `none` (a Claude login) in login mode and
+   `ANTHROPIC_API_KEY` in api-key mode, or the run's outcome is discarded as
+   `claude_wrong_auth`. That message doesn't name the provider, which is why
+   step 2 exists for login mode.
 
 `--load-user-config` turns your customizations back on (no `--safe-mode`). Your
 hooks then run, and **hooks can run commands**, whatever tools Claude itself
 has. Use it only if you want that.
 
 **Api-key mode** refuses to start without `ANTHROPIC_API_KEY`. Set it in your
-own shell; it is never written to evidence or logs. Bare mode reads nothing
-else from your machine, so the key is what it uses.
+own shell; it is never written to evidence or logs. Bare mode reads no settings
+files, and with the overrides above removed, the key is what it uses. A gateway
+set with `ANTHROPIC_BASE_URL` is removed too, so the key goes to Anthropic's API.
 
 Organization-managed settings (managed policy) apply in every mode, including
 policy-configured hooks; this adapter cannot switch those off.
@@ -76,6 +87,11 @@ Results come back through Claude Code's structured output (`--json-schema`), so
 the outcome is validated rather than parsed out of free text. If a run finishes
 without structured output, the adapter accepts a reply that is exactly the
 outcome JSON, and records which path it used as `outcome_source`.
+
+Each run's init message also lists the tools the session really had. A run
+reporting any MCP tool, or a tool that runs commands, edits files or reaches
+the network, is discarded as `claude_unexpected_tools`. The report keeps the
+tool list, the credential source, the model and the Claude Code version.
 
 ## Try one task
 
@@ -131,7 +147,8 @@ is not what you are charged. Use `--no-telemetry` to stop reporting usage.
 ## Tests and status
 
 `tests/test_claude_code_example.py` covers both auth modes, removal of every
-authentication and provider switch, the `claude auth status` check, safe mode
+authentication and provider switch in both modes, the `claude auth status` check
+against the worker's own settings, the per-run credential and tool checks, safe mode
 and its opt-out, the read boundary checks, the locked-down flags, prompt
 delivery on stdin, every outcome and failure mapping, timeout, cancellation of
 a running process, the output limit, usage reporting, and an end-to-end run
