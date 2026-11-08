@@ -18,13 +18,24 @@ REPO = Path(__file__).resolve().parents[1]
 
 FAKE_CLAUDE = r'''
 import json, os, pathlib, sys, time
+AUTH_NAMES = sorted(n for n in os.environ if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")))
+if sys.argv[1:] == ["auth", "status"]:
+    method = os.environ.get("FAKE_AUTH_METHOD", "claude.ai")
+    auth_log = os.environ.get("FAKE_AUTH_LOG")
+    if auth_log:
+        pathlib.Path(auth_log).write_text(json.dumps({"auth_names": AUTH_NAMES}))
+    print(json.dumps({"loggedIn": method != "none", "authMethod": method}))
+    sys.exit(0 if method != "none" else 1)
 mode = os.environ.get("FAKE_CLAUDE_MODE", "structured")
 stdin = sys.stdin.read()
 log = os.environ.get("FAKE_CLAUDE_LOG")
 if log:
     pathlib.Path(log).write_text(json.dumps({
-        "argv": sys.argv[1:], "stdin": stdin, "has_key": "ANTHROPIC_API_KEY" in os.environ}))
-pathlib.Path("started").touch()
+        "argv": sys.argv[1:], "stdin": stdin, "has_key": "ANTHROPIC_API_KEY" in os.environ,
+        "auth_names": AUTH_NAMES}))
+for name, value in (("FAKE_STARTED", "started"), ("FAKE_PID", str(os.getpid()))):
+    if os.environ.get(name):
+        pathlib.Path(os.environ[name]).write_text(value)
 usage = {"input_tokens": 100, "output_tokens": 20,
          "cache_creation_input_tokens": 5, "cache_read_input_tokens": 0}
 base = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 2,
@@ -95,15 +106,25 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
         self.fake.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}", encoding="utf-8")
         self.fake.chmod(0o755)
         self.log = self.root / "invocation.json"
+        self.auth_log = self.root / "auth.json"
+        self.config = self.root / "claude-config"  # stands in for ~/.claude
+        self.config.mkdir()
+        self.work = self.root / "work"
+        self.work.mkdir()
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def executor(self, mode="structured", auth="login", **kwargs):
+    def environment(self, mode="structured", **extra):
         environment = {**os.environ, "FAKE_CLAUDE_MODE": mode, "FAKE_CLAUDE_LOG": str(self.log),
+                       "FAKE_AUTH_LOG": str(self.auth_log), "CLAUDE_CONFIG_DIR": str(self.config),
                        "ANTHROPIC_API_KEY": "test-key-not-real"}
-        return ClaudeCodeExecutor(auth=auth, working_directory=self.root, command=(str(self.fake),),
-                                  environment=environment, **kwargs)
+        environment.update(extra)
+        return environment
+
+    def executor(self, mode="structured", auth="login", environment=None, **kwargs):
+        return ClaudeCodeExecutor(auth=auth, working_directory=self.work, command=(str(self.fake),),
+                                  environment=environment or self.environment(mode), **kwargs)
 
     def run_one(self, mode="structured", **kwargs):
         executor = self.executor(mode, **kwargs)
@@ -115,19 +136,49 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
     def invocation(self):
         return json.loads(self.log.read_text())
 
-    def test_login_mode_uses_the_login_and_user_settings_only(self):
+    def test_login_mode_uses_the_login_in_safe_mode_with_user_settings_only(self):
         outcome, executor = self.run_one(auth="login")
         self.assertIsInstance(outcome, Completed)
         self.assertEqual({"value": 42}, dict(outcome.result))
         seen = self.invocation()
         self.assertNotIn("--bare", seen["argv"])
-        self.assertIn("--setting-sources", seen["argv"])
+        self.assertIn("--safe-mode", seen["argv"])
         self.assertEqual("user", seen["argv"][seen["argv"].index("--setting-sources") + 1])
         self.assertFalse(seen["has_key"], "an exported API key must not reach a login-mode run")
         report = executor.last_report[1]
         self.assertEqual("structured_output", report["outcome_source"])
         self.assertEqual("login", report["auth"])
+        self.assertEqual("claude.ai", report["auth_method"])
+        self.assertTrue(report["safe_mode"])
         self.assertEqual(0.0123, report["total_cost_usd"])
+
+    def test_login_mode_removes_every_auth_and_provider_switch(self):
+        environment = self.environment(
+            ANTHROPIC_AUTH_TOKEN="t", ANTHROPIC_BASE_URL="http://gateway", ANTHROPIC_PROFILE="p",
+            CLAUDE_CODE_USE_BEDROCK="1", CLAUDE_CODE_USE_VERTEX="1",
+            CLAUDE_CODE_OAUTH_TOKEN="login-token")
+        outcome, executor = self.run_one(environment=environment)
+        self.assertIsInstance(outcome, Completed)
+        self.assertEqual([], json.loads(self.auth_log.read_text())["auth_names"],
+                         "auth status must be checked with the same clean environment")
+        self.assertEqual([], self.invocation()["auth_names"])
+        self.assertIn("CLAUDE_CODE_USE_BEDROCK", executor.removed_variables)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", executor.last_report[1]["removed_variables"])
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", executor.removed_variables)
+
+    def test_login_mode_refuses_anything_but_a_claude_login(self):
+        for method in ("api_key", "api_key_helper", "third_party", "none"):
+            with self.subTest(method=method):
+                with self.assertRaises(ValueError):
+                    self.executor(environment=self.environment(FAKE_AUTH_METHOD=method))
+        executor = self.executor(environment=self.environment(FAKE_AUTH_METHOD="oauth_token"))
+        self.assertEqual("oauth_token", executor.auth_method)
+
+    def test_user_customizations_are_an_explicit_opt_in(self):
+        self.run_one(load_user_config=True)
+        self.assertNotIn("--safe-mode", self.invocation()["argv"])
+        with self.assertRaises(ValueError):
+            self.executor(auth="api-key", load_user_config=True)
 
     def test_api_key_mode_runs_bare_with_the_key(self):
         outcome, _ = self.run_one(auth="api-key")
@@ -139,9 +190,9 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
 
     def test_api_key_mode_requires_a_key(self):
         with self.assertRaisesRegex(ValueError, "ANTHROPIC_API_KEY"):
-            ClaudeCodeExecutor(auth="api-key", working_directory=self.root, environment={})
+            ClaudeCodeExecutor(auth="api-key", working_directory=self.work, environment={})
         with self.assertRaises(ValueError):
-            ClaudeCodeExecutor(auth="password", working_directory=self.root, environment={})
+            ClaudeCodeExecutor(auth="password", working_directory=self.work, environment={})
 
     def test_locked_down_by_default_and_prompt_goes_on_stdin(self):
         self.run_one()
@@ -161,6 +212,30 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
         argv = self.invocation()["argv"]
         self.assertEqual("Read,Grep,Glob", argv[argv.index("--tools") + 1])
         self.assertIn("cannot edit files", self.invocation()["stdin"])
+
+    def test_read_only_login_refuses_user_rules_that_widen_reads(self):
+        for permissions in ({"additionalDirectories": ["/elsewhere"]},
+                            {"allow": ["Read(//Users/me/**)"]}, {"allow": ["Grep"]}):
+            with self.subTest(permissions=permissions):
+                (self.config / "settings.json").write_text(json.dumps({"permissions": permissions}))
+                with self.assertRaisesRegex(ValueError, "other folders"):
+                    self.executor(read_only_tools=True)
+        (self.config / "settings.json").write_text(json.dumps({"permissions": {"allow": ["WebSearch"]}}))
+        self.executor(read_only_tools=True).close()
+        # api-key mode never loads user settings, so the same rules don't matter there.
+        (self.config / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+        self.executor(auth="api-key", read_only_tools=True).close()
+
+    def test_read_only_refuses_symlinks_that_leave_the_working_directory(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.work / "inside.txt").write_text("ok")
+        (self.work / "local-link").symlink_to(self.work / "inside.txt")
+        self.executor(read_only_tools=True).close()
+        (self.work / "nested").mkdir()
+        (self.work / "nested" / "escape").symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "nested/escape"):
+            self.executor(read_only_tools=True)
 
     def test_model_effort_and_limits_are_passed(self):
         self.run_one(model="sonnet", effort="high", max_turns=6, max_budget_usd=1.25)
@@ -191,24 +266,33 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
         outcome, _ = self.run_one("auth_error")
         self.assertIn("Invalid API key", outcome.reason)
 
-    def test_timeout_output_limit_and_cancel(self):
+    def test_timeout_and_output_limit(self):
         outcome, _ = self.run_one("sleep", timeout=0.3)
         self.assertEqual("claude_timeout", outcome.code)
         outcome, _ = self.run_one("overflow", timeout=5)
         self.assertEqual("claude_output_too_large", outcome.code)
-        executor = self.executor("sleep", timeout=10)
+
+    def test_cancel_stops_a_running_claude_process(self):
+        started, pid_file = self.root / "cancel-started", self.root / "cancel-pid"
+        executor = self.executor(environment=self.environment(
+            "sleep", FAKE_STARTED=str(started), FAKE_PID=str(pid_file)), timeout=10)
         outcomes = []
         thread = threading.Thread(target=lambda: outcomes.append(executor.execute(assignment())))
         thread.start()
         try:
-            deadline = time.monotonic() + 3
-            while not (self.root / "started").exists() and time.monotonic() < deadline:
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
+            self.assertTrue(started.exists(), "the stand-in never started")
+            pid = int(pid_file.read_text())
+            os.kill(pid, 0)  # running now
             executor.cancel("task:1:attempt:1")
-            thread.join(3)
+            thread.join(5)
             self.assertFalse(thread.is_alive())
             self.assertIsInstance(outcomes[0], RetryableFailure)
             self.assertEqual("claude_cancelled", outcomes[0].code)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
         finally:
             executor.close()
             thread.join(3)
@@ -237,14 +321,15 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
 
     def test_worker_requires_an_explicit_auth_choice(self):
         with self.assertRaises(SystemExit):
-            parse_args(["--working-directory", str(self.root)])
-        args = parse_args(["--auth", "login", "--working-directory", str(self.root)])
+            parse_args(["--working-directory", str(self.work)])
+        args = parse_args(["--auth", "login", "--working-directory", str(self.work)])
         self.assertEqual("login", args.auth)
+        self.assertFalse(args.load_user_config)
 
     def test_live_smoke_with_stand_in_reaches_budget_accounting(self):
         evidence = self.root / "evidence"
-        environment = {**os.environ, "FAKE_CLAUDE_MODE": "structured"}
-        environment.pop("ANTHROPIC_API_KEY", None)
+        environment = {**os.environ, "FAKE_CLAUDE_MODE": "structured",
+                       "CLAUDE_CONFIG_DIR": str(self.config)}
         done = subprocess.run(
             [sys.executable, "-m", "examples.claude_code.live_smoke", "--yes", "--auth", "login",
              "--claude-command", str(self.fake), "--output", str(evidence)],
@@ -253,6 +338,7 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
         summary = json.loads((evidence / "summary.json").read_text())
         self.assertTrue(all(summary["checks"].values()), summary["checks"])
         self.assertEqual("login", summary["claude_report"]["auth"])
+        self.assertEqual("claude.ai", summary["claude_report"]["auth_method"])
 
 
 if __name__ == "__main__":

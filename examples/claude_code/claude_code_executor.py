@@ -2,10 +2,12 @@
 
 Two ways to authenticate, chosen explicitly:
 
-- ``login``: your normal Claude Code login (for example a subscription). Only
-  your user-level Claude Code settings load; project and local settings from the
-  working directory do not. ``ANTHROPIC_API_KEY`` is removed from the child's
-  environment so an exported key cannot silently switch billing.
+- ``login``: your normal Claude Code login (for example a subscription). Runs
+  with ``--safe-mode`` unless you opt in to your customizations, so user hooks,
+  plugins, skills, CLAUDE.md and auto memory do not load. Only user-level
+  settings load (``--setting-sources user``). Environment variables that would
+  switch authentication or provider are removed, and ``claude auth status`` must
+  report a Claude login before the worker accepts work.
 - ``api-key``: ``claude --bare`` with ``ANTHROPIC_API_KEY`` from the environment.
   Bare mode skips hooks, plugins, skills, MCP servers, auto memory and
   CLAUDE.md, so every machine gets the same run.
@@ -13,7 +15,8 @@ Two ways to authenticate, chosen explicitly:
 Either way, built-in tools are off unless ``read_only_tools`` is set, MCP tools
 and slash commands are disabled, anything that would need approval is denied,
 and the session is not saved. Logplane owns retries; this adapter never asks
-Claude Code to resume a session.
+Claude Code to resume a session. Organization-managed settings still apply in
+every mode; this adapter cannot switch those off.
 """
 
 from __future__ import annotations
@@ -43,6 +46,83 @@ READ_ONLY_TOOLS = "Read,Grep,Glob"
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_PROMPT_BYTES = 48 * 1024
 MAX_REASON_CHARS = 300
+LOGIN_AUTH_METHODS = ("claude.ai", "oauth_token")
+MAX_SCANNED_ENTRIES = 500_000
+
+
+def _switches_auth_or_provider(name: str) -> bool:
+    """Variables that would make a login-mode run authenticate some other way.
+
+    Covers API keys and tokens, gateways and base URLs, profiles and workload
+    identity federation (all ANTHROPIC_*), and the Bedrock, Google Cloud and
+    Foundry provider switches (CLAUDE_CODE_USE_*). The Claude login's own
+    CLAUDE_CODE_OAUTH_TOKEN is kept.
+    """
+    return name.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")) or name == "AWS_BEARER_TOKEN_BEDROCK"
+
+
+def check_auth_status(command: tuple[str, ...], environment: dict) -> str:
+    """Ask Claude Code which authentication it would use; return the method."""
+    try:
+        done = subprocess.run([*command, "auth", "status"], env=environment, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"could not run `claude auth status`: {type(exc).__name__}") from exc
+    try:
+        method = json.loads(done.stdout).get("authMethod")
+    except (ValueError, AttributeError):
+        method = None
+    if done.returncode != 0 or not isinstance(method, str) or method == "none":
+        raise ValueError("Claude Code is not logged in; run `claude auth login`, "
+                         "or use --auth api-key")
+    return method
+
+
+def _user_settings_path(environment: dict) -> Path:
+    base = environment.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        environment.get("HOME") or os.path.expanduser("~"), ".claude")
+    return Path(base).expanduser() / "settings.json"
+
+
+def widening_read_rules(settings_path: Path) -> list[str]:
+    """User-level permission rules that would let read tools reach other folders."""
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not read {settings_path} to check read permissions") from exc
+    permissions = settings.get("permissions") if isinstance(settings, dict) else None
+    if not isinstance(permissions, dict):
+        return []
+    found = []
+    directories = permissions.get("additionalDirectories")
+    if directories:
+        found.append("permissions.additionalDirectories")
+    for rule in permissions.get("allow") or []:
+        if isinstance(rule, str) and rule.split("(", 1)[0].strip() in {"Read", "Grep", "Glob"}:
+            found.append(f"permissions.allow {rule!r}")
+    return found
+
+
+def outside_symlinks(directory: Path, limit: int = MAX_SCANNED_ENTRIES) -> list[str]:
+    """Symlinks under ``directory`` that resolve outside it (first few)."""
+    found, seen = [], 0
+    for root, dirs, files in os.walk(directory, followlinks=False):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in dirs + files:
+            seen += 1
+            if seen > limit:
+                raise ValueError(f"working_directory has over {limit} entries to check; "
+                                 "point the worker at a smaller folder")
+            path = Path(root) / name
+            if path.is_symlink():
+                target = path.resolve()
+                if target != directory and directory not in target.parents:
+                    found.append(str(path.relative_to(directory)))
+                    if len(found) >= 5:
+                        return found
+    return found
 
 # Flat string fields only, so the schema stays within what structured output
 # supports everywhere. ``result_json`` carries the agent's result object.
@@ -194,7 +274,8 @@ class ClaudeCodeExecutor:
                  model: Optional[str] = None, effort: Optional[str] = None,
                  read_only_tools: bool = False, timeout: float = 300, max_turns: int = 4,
                  max_budget_usd: float = 0.50, telemetry_sink=None,
-                 environment: Optional[dict] = None):
+                 environment: Optional[dict] = None, load_user_config: bool = False,
+                 verify_auth: bool = True):
         if auth not in AUTH_MODES:
             raise ValueError(f"auth must be one of {', '.join(AUTH_MODES)}")
         if not command or not all(isinstance(item, str) and item for item in command):
@@ -209,18 +290,38 @@ class ClaudeCodeExecutor:
             raise ValueError(f"effort must be one of {', '.join(EFFORT_LEVELS)}")
         if model is not None and not model.strip():
             raise ValueError("model must not be empty")
+        if load_user_config and auth != "login":
+            raise ValueError("load_user_config applies only to --auth login")
         base = dict(os.environ if environment is None else environment)
+        self.removed_variables: list[str] = []
+        self.auth_method: Optional[str] = None
         if auth == "api-key":
             if not base.get("ANTHROPIC_API_KEY"):
                 raise ValueError("--auth api-key needs ANTHROPIC_API_KEY in the worker's environment")
         else:
-            # Use the login, never an API key that happens to be exported.
-            base.pop("ANTHROPIC_API_KEY", None)
+            # Use the login, never a key, token, gateway or provider that
+            # happens to be exported. Names are reported; values never are.
+            self.removed_variables = sorted(name for name in base if _switches_auth_or_provider(name))
+            for name in self.removed_variables:
+                del base[name]
         self.environment = base
         self.directory = Path(working_directory).expanduser().resolve()
         if not self.directory.is_dir():
             raise ValueError("working_directory must exist")
+        if read_only_tools:
+            if auth == "login":
+                rules = widening_read_rules(_user_settings_path(base))
+                if rules:
+                    raise ValueError(
+                        "--read-only-tools with --auth login: your Claude Code user settings "
+                        "would let reads reach other folders (" + "; ".join(rules) +
+                        "). Remove them, or use --auth api-key, which does not load them")
+            links = outside_symlinks(self.directory)
+            if links:
+                raise ValueError("--read-only-tools: these symlinks point outside the working "
+                                 "directory: " + ", ".join(links))
         self.auth, self.command, self.model, self.effort = auth, tuple(command), model, effort
+        self.load_user_config = load_user_config
         self.read_only_tools, self.timeout = read_only_tools, timeout
         self.max_turns, self.max_budget_usd = max_turns, max_budget_usd
         self.telemetry_sink = telemetry_sink
@@ -228,6 +329,14 @@ class ClaudeCodeExecutor:
         self._active: dict[str, threading.Event] = {}
         self._closed = False
         self.last_report: tuple[str, dict] | None = None
+        if auth == "login" and verify_auth:
+            method = check_auth_status(self.command, self.environment)
+            if method not in LOGIN_AUTH_METHODS:
+                raise ValueError(
+                    f"--auth login, but Claude Code would authenticate with {method!r}, "
+                    "probably from an apiKeyHelper or env setting in your Claude Code settings. "
+                    "Remove it, or use --auth api-key")
+            self.auth_method = method
 
     def argv(self) -> list[str]:
         argv = [*self.command]
@@ -246,6 +355,8 @@ class ClaudeCodeExecutor:
                  "--max-budget-usd", f"{self.max_budget_usd:g}"]
         if self.auth == "login":
             argv += ["--setting-sources", "user"]
+            if not self.load_user_config:
+                argv.append("--safe-mode")
         if self.model:
             argv += ["--model", self.model]
         if self.effort:
@@ -287,6 +398,12 @@ class ClaudeCodeExecutor:
         started = time.monotonic()
         outcome, report = self._run(prompt, cancelled)
         report["auth"] = self.auth
+        if self.auth_method:
+            report["auth_method"] = self.auth_method
+        if self.removed_variables:
+            report["removed_variables"] = self.removed_variables
+        if self.auth == "login":
+            report["safe_mode"] = not self.load_user_config
         with self._lock:
             self.last_report = (assignment.assignment_id, report)
         model = (report.get("models") or [requested_model])[0]

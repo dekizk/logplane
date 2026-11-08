@@ -1,7 +1,9 @@
 """Start a Claude Code worker against an existing bus.
 
 Choose how Claude Code authenticates with --auth:
-  login    your normal Claude Code login (for example a subscription)
+  login    your normal Claude Code login (for example a subscription), checked
+           with `claude auth status` before any work; runs in --safe-mode
+           unless you pass --load-user-config
   api-key  claude --bare, billed to ANTHROPIC_API_KEY
 """
 
@@ -33,6 +35,9 @@ def parse_args(argv=None):
                         help="where Claude Code runs; with --read-only-tools, what it may read")
     parser.add_argument("--model", help="model alias or name; defaults to Claude Code's own default")
     parser.add_argument("--effort", choices=EFFORT_LEVELS)
+    parser.add_argument("--load-user-config", action="store_true",
+                        help="login mode: load your hooks, plugins, skills, CLAUDE.md and auto "
+                             "memory instead of --safe-mode (hooks can run commands)")
     parser.add_argument("--read-only-tools", action="store_true",
                         help="allow Read, Grep and Glob in the working directory (default: no tools)")
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds per assignment")
@@ -59,13 +64,21 @@ def main(argv=None):
         command=(args.claude_command,), model=args.model, effort=args.effort,
         read_only_tools=args.read_only_tools, timeout=args.timeout, max_turns=args.max_turns,
         max_budget_usd=args.max_budget_usd, telemetry_sink=telemetry,
+        load_user_config=args.load_user_config,
     )
     worker_executor = (RecordingExecutor(executor, args.record, report_key="claude_report")
                        if args.record else executor)
     runtime = WorkerRuntime(bus, name=args.name, executor=worker_executor, instance_id=instance_id,
                             capacity=args.capacity, capabilities=args.capabilities or ["claude"],
                             heartbeat_seconds=args.heartbeat_seconds)
-    print(f"[{args.name}] Claude Code worker, auth={args.auth}", flush=True)
+    details = [f"auth={args.auth}"]
+    if executor.auth_method:
+        details.append(f"verified login: {executor.auth_method}")
+    if args.auth == "login":
+        details.append("user customizations loaded" if args.load_user_config else "safe mode")
+    if executor.removed_variables:
+        details.append("ignoring " + ", ".join(executor.removed_variables))
+    print(f"[{args.name}] Claude Code worker, " + "; ".join(details), flush=True)
     try:
         runtime.run()
     except KeyboardInterrupt:
