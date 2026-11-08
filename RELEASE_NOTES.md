@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **New example: Claude Code as a Logplane worker.** `examples/claude_code/`
+  runs one non-interactive `claude -p` turn per assignment. You choose how it
+  authenticates: `--auth login` uses your Claude Code login with user-level
+  settings only, and `--auth api-key` runs `--bare` with `ANTHROPIC_API_KEY`.
+  Tools are off by default, with an optional read-only mode (Read, Grep, Glob).
+  MCP tools and slash commands are disabled, approvals are denied, and sessions
+  are not saved. Outcomes come back through Claude Code's structured output.
+  Each call's tokens and estimated cost reach Logplane's workflow accounting,
+  so workflow cost caps cover Claude workers. The OpenClaw worker's
+  `RecordingExecutor` gains a `report_key` argument; its default is unchanged.
 - **New example: an interruption trial across Hermes and OpenClaw.**
   `examples/openclaw/interruption_trial.py` runs each worker as its own process.
   It kills one OpenClaw worker mid-task, freezes a second past its lease, and
