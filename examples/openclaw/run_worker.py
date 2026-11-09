@@ -32,9 +32,10 @@ class RecordingExecutor:
     owned. Records hold assignment inputs and agent outcomes, not credentials.
     """
 
-    def __init__(self, delegate, path: Path):
+    def __init__(self, delegate, path: Path, *, report_key: str = "openclaw_report"):
         self.delegate = delegate
         self.path = path
+        self.report_key = report_key
         self._lock = threading.Lock()
 
     def _append(self, entry: dict) -> None:
@@ -49,10 +50,10 @@ class RecordingExecutor:
         outcome = self.delegate.execute(assignment)
         entry = {"event": "returned", "assignment_id": assignment.assignment_id,
                  "outcome": outcome_record(outcome)}
-        # OpenClaw-reported usage and cost, kept apart from the agent's result.
+        # Agent-reported usage and cost, kept apart from the agent's result.
         report = getattr(self.delegate, "last_report", None)
         if report and report[0] == assignment.assignment_id:
-            entry["openclaw_report"] = report[1]
+            entry[self.report_key] = report[1]
         self._append(entry)
         return outcome
 

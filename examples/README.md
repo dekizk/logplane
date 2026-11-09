@@ -25,6 +25,9 @@ Copyable examples:
   cap, and idempotent filing through a Python agent.
 - [`audit_triage/`](audit_triage/) explains the `logplane demo audit-triage`
   pipeline and how to swap its stand-in stages for real agents.
+- [`claude_code/`](claude_code/) runs Claude Code (`claude -p`) as a worker, with
+  your Claude Code login or an API key, tools off or read-only, and usage
+  reported to workflow budgets.
 - [`openclaw/`](openclaw/) runs OpenClaw as a tool-free worker: one task, a Hermes ->
   OpenClaw handoff, and a trial that crashes and freezes workers mid-task, each
   through a disposable live bus.
