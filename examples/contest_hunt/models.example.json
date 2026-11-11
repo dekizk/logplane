@@ -1,0 +1,17 @@
+{
+  "models": {
+    "fable": {"runner": "claude", "model": "fable", "effort": "high", "capacity": 1,
+              "timeout": 3600, "max_turns": 150, "max_budget_usd": 20},
+    "opus":  {"runner": "claude", "model": "opus", "effort": "high", "capacity": 2,
+              "timeout": 2400, "max_turns": 120, "max_budget_usd": 10},
+    "astra": {"runner": "codex", "model": "REPLACE-with-your-Codex-Astra-model-id", "effort": "high",
+              "capacity": 2, "timeout": 2400},
+    "glm":   {"runner": "hermes", "provider": "nous", "model": "REPLACE-with-the-GLM-5.3-id-in-hermes",
+              "effort": "high", "capacity": 2, "timeout": 1800}
+  },
+  "stages": {
+    "map": "fable",
+    "hunt": ["astra", "opus", "glm"],
+    "triage": "astra"
+  }
+}

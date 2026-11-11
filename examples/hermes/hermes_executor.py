@@ -85,6 +85,7 @@ class HermesExecutor:
         environment: Optional[Mapping[str, str]] = None,
         usage_callback: Optional[UsageCallback] = None,
         telemetry_sink: Optional[TelemetrySink] = None,
+        max_prompt_bytes: int = MAX_PROMPT_BYTES,
     ):
         self.command = self._strings(command, "command")
         self.toolsets = tuple(
@@ -139,6 +140,7 @@ class HermesExecutor:
         self.environment = normalized_environment
         self.usage_callback = usage_callback
         self.telemetry_sink = telemetry_sink
+        self.max_prompt_bytes = max_prompt_bytes
 
         self._lock = threading.Lock()
         self._processes: dict[str, subprocess.Popen] = {}
@@ -147,7 +149,7 @@ class HermesExecutor:
 
     def execute(self, assignment: AssignmentContext) -> Outcome:
         prompt = self.build_prompt(assignment)
-        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        if len(prompt.encode("utf-8")) > self.max_prompt_bytes:
             return PermanentFailure(
                 "hermes_prompt_too_large",
                 "serialized Hermes assignment prompt exceeds the example limit",

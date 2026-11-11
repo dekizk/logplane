@@ -1,0 +1,202 @@
+{
+  "name": "precept",
+  "title": "Templar Precept bounty contest (Guardian Defender)",
+  "repository": "https://github.com/GuardianOrg/templar-protocol-precept-bounty-contest-guardian",
+  "scope_commit": "3a4f2a842e47f94663efadaffc3706ae674e5ff2",
+  "checkout_commit": "4d726d1",
+  "diff_base": "b56a2fe2447e5b8870ea5f7b46177c1f68908a2b",
+  "diff_final": "05f38897c9c624fa4ff3e1f1ac71078c0aa05ed7",
+  "language": "rust",
+  "test_module_marker": "#[cfg(test)]",
+  "scope_files": [
+    "backstop/src/backstop/deposit.rs",
+    "backstop/src/backstop/mod.rs",
+    "backstop/src/backstop/user.rs",
+    "backstop/src/backstop/withdrawal.rs",
+    "backstop/src/constants.rs",
+    "backstop/src/contract.rs",
+    "backstop/src/dependencies/mod.rs",
+    "backstop/src/dependencies/pool.rs",
+    "backstop/src/emissions/claim.rs",
+    "backstop/src/emissions/distributor.rs",
+    "backstop/src/emissions/manager.rs",
+    "backstop/src/emissions/mod.rs",
+    "backstop/src/errors.rs",
+    "backstop/src/events.rs",
+    "backstop/src/lib.rs",
+    "backstop/src/storage.rs",
+    "pool-factory/src/pool_factory.rs",
+    "pool/src/auctions/auction.rs",
+    "pool/src/auctions/backstop_interest_auction.rs",
+    "pool/src/auctions/bad_debt_auction.rs",
+    "pool/src/auctions/user_liquidation_auction.rs",
+    "pool/src/constants.rs",
+    "pool/src/contract.rs",
+    "pool/src/emissions/distributor.rs",
+    "pool/src/emissions/manager.rs",
+    "pool/src/errors.rs",
+    "pool/src/events.rs",
+    "pool/src/lib.rs",
+    "pool/src/math.rs",
+    "pool/src/pool/actions.rs",
+    "pool/src/pool/bad_debt.rs",
+    "pool/src/pool/config.rs",
+    "pool/src/pool/gulp.rs",
+    "pool/src/pool/health_factor.rs",
+    "pool/src/pool/interest.rs",
+    "pool/src/pool/mod.rs",
+    "pool/src/pool/pool.rs",
+    "pool/src/pool/reserve.rs",
+    "pool/src/pool/status.rs",
+    "pool/src/pool/submit.rs",
+    "pool/src/pool/user.rs",
+    "pool/src/storage.rs",
+    "shared/backstop_threshold.rs",
+    "pool-oracle-adapter/src/lib.rs",
+    "pool-oracle-adapter/src/parent.rs"
+  ],
+  "repo_docs": [
+    "README.md",
+    "docs",
+    "pool-oracle-adapter/README.md"
+  ],
+  "extra_docs": [
+    {
+      "url": "https://raw.githubusercontent.com/Templar-Protocol/precept/1507cfad97e951adf2215b740f23d3cde8dda11e/README.md",
+      "path": "precept-docs/README.md"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Templar-Protocol/precept/1507cfad97e951adf2215b740f23d3cde8dda11e/docs/how-it-works.md",
+      "path": "precept-docs/how-it-works.md"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Templar-Protocol/precept/1507cfad97e951adf2215b740f23d3cde8dda11e/docs/changes-from-blend-v2.md",
+      "path": "precept-docs/changes-from-blend-v2.md"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Templar-Protocol/precept/1507cfad97e951adf2215b740f23d3cde8dda11e/docs/lending-economics.md",
+      "path": "precept-docs/lending-economics.md"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Templar-Protocol/precept/1507cfad97e951adf2215b740f23d3cde8dda11e/docs/risks.md",
+      "path": "precept-docs/risks.md"
+    }
+  ],
+  "rules": "rules.md",
+  "known_issues": "known_issues.md",
+  "primer": "primer.md",
+  "seed_areas": [
+    {
+      "id": "A01",
+      "title": "Pool oracle adapter and price loading",
+      "files": [
+        "pool-oracle-adapter/src/lib.rs",
+        "pool-oracle-adapter/src/parent.rs",
+        "pool/src/pool/pool.rs"
+      ],
+      "focus": "SEP-40 adapter bucketing, freshness and decimals; how load_price consumes it. Adverse-but-valid prices are in scope; wrong data is not. L-05 is known."
+    },
+    {
+      "id": "A02",
+      "title": "Bad debt recognition and defaults",
+      "files": [
+        "pool/src/pool/bad_debt.rs",
+        "pool/src/auctions/bad_debt_auction.rs",
+        "backstop/src/dependencies/pool.rs",
+        "shared/backstop_threshold.rs",
+        "pool/src/pool/reserve.rs"
+      ],
+      "focus": "When debt becomes bad debt, how defaults lower b_rate, who absorbs the loss, and whether anyone can trigger or dodge it to shift losses or extract value."
+    },
+    {
+      "id": "A03",
+      "title": "User liquidation auctions",
+      "files": [
+        "pool/src/auctions/auction.rs",
+        "pool/src/auctions/user_liquidation_auction.rs",
+        "pool/src/pool/health_factor.rs",
+        "pool/src/pool/user.rs"
+      ],
+      "focus": "Auction creation, scaling over time, partial and full fills, deletion; can a liquidator take more collateral than allowed, or a borrower escape or grief to leave losses on lenders?"
+    },
+    {
+      "id": "A04",
+      "title": "Backstop interest auctions and backstop credit",
+      "files": [
+        "pool/src/auctions/backstop_interest_auction.rs",
+        "pool/src/pool/interest.rs",
+        "pool/src/pool/reserve.rs",
+        "backstop/src/contract.rs"
+      ],
+      "focus": "Accrual of backstop credit, interest auction lots and bids, and transfers between pool and backstop."
+    },
+    {
+      "id": "A05",
+      "title": "Reserve accounting and rates",
+      "files": [
+        "pool/src/pool/reserve.rs",
+        "pool/src/math.rs",
+        "pool/src/pool/interest.rs",
+        "pool/src/constants.rs"
+      ],
+      "focus": "b_rate / d_rate, supply and liability totals, utilization, rounding direction on every conversion, behaviour after defaults."
+    },
+    {
+      "id": "A06",
+      "title": "User actions, submit and flash loans",
+      "files": [
+        "pool/src/pool/actions.rs",
+        "pool/src/pool/submit.rs",
+        "pool/src/pool/user.rs",
+        "pool/src/contract.rs"
+      ],
+      "focus": "Supply, withdraw, borrow, repay, collateral moves and flash loans: health checks, ordering of state updates and transfers, authorization, request batching."
+    },
+    {
+      "id": "A07",
+      "title": "Pool configuration, status, freezes and factory",
+      "files": [
+        "pool/src/pool/config.rs",
+        "pool/src/pool/status.rs",
+        "pool/src/storage.rs",
+        "pool/src/contract.rs",
+        "pool-factory/src/pool_factory.rs"
+      ],
+      "focus": "Status transitions and what each status allows, sealed reserve configuration, factory deployment parameters. Intended ADR-0008/0011 restrictions are out of scope; defects in enforcing them are in."
+    },
+    {
+      "id": "A08",
+      "title": "Backstop deposits, withdrawals and queue",
+      "files": [
+        "backstop/src/backstop/deposit.rs",
+        "backstop/src/backstop/withdrawal.rs",
+        "backstop/src/backstop/user.rs",
+        "backstop/src/storage.rs",
+        "backstop/src/contract.rs"
+      ],
+      "focus": "Share accounting, queued withdrawals, dequeue and withdraw timing, interaction with bad debt draws on the backstop."
+    },
+    {
+      "id": "A09",
+      "title": "Backstop emissions",
+      "files": [
+        "backstop/src/emissions/claim.rs",
+        "backstop/src/emissions/distributor.rs",
+        "backstop/src/emissions/manager.rs",
+        "backstop/src/storage.rs"
+      ],
+      "focus": "Emission indexes, claims and distribution after the rewrite; ADR-0011 disabled the activation shim's emissions."
+    },
+    {
+      "id": "A10",
+      "title": "Pool emissions and gulp",
+      "files": [
+        "pool/src/pool/gulp.rs",
+        "pool/src/emissions/distributor.rs",
+        "pool/src/emissions/manager.rs",
+        "pool/src/pool/pool.rs"
+      ],
+      "focus": "Gulping token balances into reserves, donations, and pool emission indexes."
+    }
+  ]
+}
