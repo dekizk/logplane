@@ -30,7 +30,7 @@ from typing import Optional
 from examples.claude_code.claude_code_executor import _stop_process_group, outcome_from_fields
 from logplane.executors import AssignmentContext, Outcome, PermanentFailure, RetryableFailure
 
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")  # as `codex debug models` lists
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024  # the event stream includes command output
 DEFAULT_MAX_PROMPT_BYTES = 256 * 1024
 MAX_REASON_CHARS = 300
