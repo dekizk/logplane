@@ -58,7 +58,8 @@ logplane data.
   failure downstream.
 - **Humans in the loop.** An agent can block with a question, such as approval
   for a risky tool call. `logplane decide` answers it, and the answer is on
-  record.
+  record. A running agent can also ask before a single tool call and carry on
+  with the answer (`logplane approvals`), with standing rules for routine calls.
 - **Spend limits.** Model calls report tokens and cost per task and attempt.
   Workflow budgets stop admitting new work at a cap, and raising the cap is an
   event too. They gate admission; they don't cut off a model call already
@@ -244,6 +245,7 @@ the task correctly ends `failed`.
 | `logplane workflow ID` | Show a workflow's tasks, dependencies, policy, and token/cost usage (`--mermaid` for a diagram) |
 | `logplane tail ID` | Follow a workflow's events live |
 | `logplane decide` / `retry` / `cancel` | Answer a decision, grant more retries, or cancel a task |
+| `logplane approvals` / `approve` / `deny` / `approval-rules` | Answer a running agent's tool-call requests, or set standing allow and deny rules |
 | `logplane pause` / `resume` / `supersede` | Pause or resume a task or workflow, or replace a task with new intent |
 | `logplane policy` / `agent-policy` | Set workflow concurrency and budgets, or per-agent limits |
 | `logplane up` | Run the bus and coordinator together; Ctrl-C stops both (`serve` and `pm` run them separately) |

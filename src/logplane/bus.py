@@ -489,7 +489,7 @@ def _resolve_correlation_id(
             )
         resolved = task_correlation_id or resolved
 
-    if topic.startswith("workflow."):
+    if topic.startswith("workflow.") or topic == "approval.rules_set":
         if resolved is None:
             raise EventValidationError(f"{topic} requires correlation_id")
         exists = conn.execute(
@@ -506,6 +506,117 @@ def _resolve_correlation_id(
     if topic == "task.created":
         return uuid.uuid4().hex
     return None
+
+
+def _find_assignment(
+    conn: sqlite3.Connection,
+    assignment_id: object,
+) -> Optional[sqlite3.Row]:
+    """The PM's task.assigned event for an attempt, by its stable key."""
+    if not isinstance(assignment_id, str):
+        return None
+    row = conn.execute(
+        "SELECT * FROM events WHERE actor = 'pm' AND idempotency_key = ?",
+        (f"assign:{assignment_id}",),
+    ).fetchone()
+    if row is None or row["topic"] != "task.assigned":
+        return None
+    return row
+
+
+def _require_own_assignment(
+    conn: sqlite3.Connection,
+    *,
+    topic: str,
+    actor: str,
+    payload: dict,
+) -> sqlite3.Row:
+    assignment = _find_assignment(conn, payload.get("assignment_id"))
+    if assignment is None:
+        raise EventValidationError(f"{topic} does not name a recorded assignment")
+    assigned = json.loads(assignment["payload"])
+    if (
+        assigned.get("task_id") != payload.get("task_id")
+        or assigned.get("assignee") != actor
+        or assigned.get("worker_instance_id") != payload.get("worker_instance_id")
+    ):
+        raise EventValidationError(
+            f"{topic} must come from the worker that holds the assignment"
+        )
+    return assignment
+
+
+def _check_approval_references(
+    conn: sqlite3.Connection,
+    *,
+    topic: str,
+    actor: str,
+    caused_by: Optional[int],
+    payload: dict,
+) -> None:
+    """Checks on approvals and decisions that need stored history.
+
+    An agent must not be able to answer its own question: a decision or an
+    approval recorded under the requesting worker's own actor is refused here,
+    at write time, so existing histories replay exactly as before.
+    """
+    if topic == "decision.made":
+        assignment = _find_assignment(conn, payload.get("assignment_id"))
+        if assignment is not None and json.loads(assignment["payload"]).get("assignee") == actor:
+            raise EventValidationError(
+                "a decision cannot be made by the agent that asked for it"
+            )
+        return
+    if topic == "approval.requested":
+        assignment = _require_own_assignment(conn, topic=topic, actor=actor, payload=payload)
+        if caused_by != assignment["id"]:
+            raise EventValidationError(
+                "approval.requested must be caused by its task.assigned event"
+            )
+        return
+    if topic == "approval.rule_applied":
+        assignment = _require_own_assignment(
+            conn, topic=topic, actor=actor, payload=payload
+        )
+        rules = conn.execute("SELECT * FROM events WHERE id = ?", (caused_by,)).fetchone()
+        if rules is None or rules["topic"] != "approval.rules_set":
+            raise EventValidationError(
+                "approval.rule_applied must be caused by an approval.rules_set event"
+            )
+        if rules["actor"] == actor:
+            raise EventValidationError(
+                "an agent cannot apply approval rules that it set itself"
+            )
+        if rules["correlation_id"] != assignment["correlation_id"]:
+            raise EventValidationError(
+                "approval rules belong to a different workflow"
+            )
+        return
+    if topic == "approval.resolved":
+        request = conn.execute("SELECT * FROM events WHERE id = ?", (caused_by,)).fetchone()
+        if request is None or request["topic"] != "approval.requested":
+            raise EventValidationError(
+                "approval.resolved must be caused by an approval.requested event"
+            )
+        requested = json.loads(request["payload"])
+        for field in ("task_id", "assignment_id", "approval_id"):
+            if requested.get(field) != payload.get(field):
+                raise EventValidationError(
+                    f"approval.resolved {field} conflicts with the request"
+                )
+        if request["actor"] == actor:
+            raise EventValidationError(
+                "an approval cannot be resolved by the agent that requested it"
+            )
+        existing = conn.execute(
+            "SELECT id FROM events WHERE topic = 'approval.resolved' AND caused_by = ?",
+            (caused_by,),
+        ).fetchone()
+        if existing is not None:
+            raise EventValidationError(
+                f"approval request #{caused_by} was already resolved at event "
+                f"#{existing['id']}"
+            )
 
 
 def _assert_idempotent_match(
@@ -650,6 +761,13 @@ def append_event(
             correlation_id=correlation_id,
             payload=requested_payload,
             producer=producer,
+        )
+        _check_approval_references(
+            conn,
+            topic=topic,
+            actor=actor,
+            caused_by=caused_by,
+            payload=requested_payload,
         )
         payload = dict(requested_payload)
         origin_claim = None

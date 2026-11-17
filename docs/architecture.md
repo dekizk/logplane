@@ -105,7 +105,8 @@ two rows are runtime data in the directory where you run logplane.
 | `adoption.py` | Controlled, shadow, and deterministic canary integration helpers |
 | `telemetry.py` | Optional model/tool telemetry sink, lifecycle helpers, and producer identity |
 | `artifacts.py` | Atomic, content-addressed local storage for opt-in captured content |
-| `topics.py` | Canonical coordination, integration, and telemetry topic groups |
+| `topics.py` | Canonical coordination, integration, approval, and telemetry topic groups |
+| `approvals.py`, `gate.py` | In-attempt tool-call approvals, standing rules, and the agent hook entry point |
 | `worker.py` | Demo executor wired through the reusable runtime |
 | `demo.py` | Scripted `logplane demo` scenarios with real processes in a throwaway directory |
 | `.logplane/events.db` | Append-only event log and task-id counter (path set in `logplane.local.json`) |
