@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Tool-call approvals: ask before one tool call without restarting the
+  agent.** A running attempt can publish `approval.requested` and keep its
+  assignment while it waits; `logplane approvals`, `approve` and `deny` answer
+  it, and the same attempt continues. `logplane approval-rules` sets standing
+  allow and deny rules per workflow (`TOOL` or `TOOL:INPUT_PATTERN`), and each
+  call a rule settles is recorded as `approval.rule_applied`. Anything the
+  gate cannot establish is a denial. The four `approval.*` topics are
+  validated but stay outside PM replay, so coordination state, snapshots and
+  existing histories are unchanged. Python executors use
+  `logplane.approvals.ApprovalGate`; `logplane gate claude-hook` is a Claude
+  Code `PreToolUse` hook, and the Claude Code worker gains `--gated-tools` to
+  grant Bash, Edit and similar tools behind it; time spent waiting for an
+  answer does not count against the worker's `--timeout`. Deny rules for Bash
+  also match each part of a compound command and see through git's global
+  options, while allow rules stay literal. `--gated-tools` has been run live
+  with `--auth login --load-user-config`; `--auth api-key` has stand-in
+  coverage only.
+- **An agent's own name can no longer answer its own question.** The bus now
+  refuses a `decision.made`, or an approval, recorded under the actor of the
+  worker that asked. This applies to new events only; existing histories
+  replay as before. Actor names remain self-reported, so this is a guard, not
+  authentication.
 - **New example: Claude Code as a Logplane worker.** `examples/claude_code/`
   runs one non-interactive `claude -p` turn per assignment. You choose how it
   authenticates. `--auth login` uses your Claude Code login in `--safe-mode`,

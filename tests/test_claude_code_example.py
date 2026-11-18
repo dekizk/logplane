@@ -59,7 +59,8 @@ log = os.environ.get("FAKE_CLAUDE_LOG")
 if log:
     pathlib.Path(log).write_text(json.dumps({
         "argv": argv, "stdin": stdin, "has_key": "ANTHROPIC_API_KEY" in os.environ,
-        "auth_names": AUTH_NAMES}))
+        "auth_names": AUTH_NAMES,
+        "gate": {n: v for n, v in os.environ.items() if n.startswith("LOGPLANE_GATE_")}}))
 for name, value in (("FAKE_STARTED", "started"), ("FAKE_PID", str(os.getpid()))):
     if os.environ.get(name):
         pathlib.Path(os.environ[name]).write_text(value)
@@ -97,6 +98,16 @@ elif mode == "auth_error":
 elif mode in ("error_max_turns", "error_max_structured_output_retries", "error_max_budget_usd"):
     base.update(subtype=mode, is_error=True)
     code = 1
+elif mode == "awaiting_approval":
+    marker = pathlib.Path(os.environ["LOGPLANE_GATE_WAITING_DIR"]) / "1.wait"
+    marker.write_text(str(time.time() + 30))
+    time.sleep(1.5)
+    marker.unlink()
+    base.update(result="Done.", structured_output=outcome)
+elif mode == "stale_marker":
+    marker = pathlib.Path(os.environ["LOGPLANE_GATE_WAITING_DIR"]) / "1.wait"
+    marker.write_text(str(time.time() - 1))
+    time.sleep(30)
 elif mode == "garbage":
     print("not json")
     sys.exit(0)
@@ -264,6 +275,93 @@ class ClaudeCodeExecutorTests(unittest.TestCase):
         outcome, executor = self.run_one(read_only_tools=True)
         self.assertIsInstance(outcome, Completed)
         self.assertEqual(["Glob", "Grep", "Read", "StructuredOutput"], executor.last_report[1]["tools"])
+
+    def gated(self, **kwargs):
+        kwargs.setdefault("auth", "api-key")
+        return dict(gated_tools=("Bash", "Edit"), gate_bus_url="http://127.0.0.1:8765",
+                    gate_actor="claude", **kwargs)
+
+    def test_gated_tools_run_behind_the_approval_hook(self):
+        outcome, executor = self.run_one(**self.gated(read_only_tools=True, approval_wait=120))
+        self.assertIsInstance(outcome, Completed)
+        seen = self.invocation()
+        argv = seen["argv"]
+        self.assertEqual("Read,Grep,Glob,Bash,Edit", argv[argv.index("--tools") + 1])
+        self.assertEqual("dontAsk", argv[argv.index("--permission-mode") + 1])
+        hook = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"]
+        self.assertEqual(1, len(hook))
+        self.assertEqual("Bash|Edit", hook[0]["matcher"])
+        command = hook[0]["hooks"][0]
+        self.assertEqual("command", command["type"])
+        self.assertTrue(command["command"].endswith("-m logplane gate claude-hook"))
+        self.assertEqual(180, command["timeout"])
+        self.assertEqual({
+            "LOGPLANE_GATE_URL": "http://127.0.0.1:8765", "LOGPLANE_GATE_ACTOR": "claude",
+            "LOGPLANE_GATE_TASK_ID": "1", "LOGPLANE_GATE_ASSIGNMENT_ID": "task:1:attempt:1",
+            "LOGPLANE_GATE_ASSIGNMENT_EVENT_ID": "3",
+            "LOGPLANE_GATE_WORKER_INSTANCE_ID": "worker-1",
+            "LOGPLANE_GATE_CORRELATION_ID": "trial", "LOGPLANE_GATE_WAIT_SECONDS": "120",
+        }, {name: value for name, value in seen["gate"].items()
+            if name != "LOGPLANE_GATE_WAITING_DIR"})
+        self.assertIn("LOGPLANE_GATE_WAITING_DIR", seen["gate"])
+        self.assertIn("approval gate", seen["stdin"])
+        self.assertEqual(["Bash", "Edit"], executor.last_report[1]["gated_tools"])
+
+    def test_waiting_for_an_approval_does_not_use_up_the_timeout(self):
+        outcome, _ = self.run_one(**self.gated(
+            timeout=0.6, environment=self.environment("awaiting_approval")))
+        self.assertIsInstance(outcome, Completed)
+        # A marker past its own expiry (left by a killed hook) holds nothing open.
+        started = time.monotonic()
+        outcome, _ = self.run_one(**self.gated(
+            timeout=0.6, environment=self.environment("stale_marker")))
+        self.assertEqual("claude_timeout", outcome.code)
+        self.assertLess(time.monotonic() - started, 10)
+        with self.assertRaisesRegex(ValueError, "approval_wait"):
+            self.executor(**self.gated(approval_wait=0))
+
+    def test_without_gated_tools_no_hook_or_gate_variables_are_passed(self):
+        self.run_one(auth="api-key")
+        seen = self.invocation()
+        self.assertNotIn("--settings", seen["argv"])
+        self.assertEqual({}, seen["gate"])
+
+    def test_gated_runs_still_discard_tools_that_were_not_granted(self):
+        outcome, _ = self.run_one(**self.gated(environment=self.environment(FAKE_TOOLS="Bash,Write")))
+        self.assertEqual("claude_unexpected_tools", outcome.code)
+        outcome, _ = self.run_one(**self.gated(
+            environment=self.environment(FAKE_TOOLS="Bash,BashOutput,KillShell,Edit")))
+        self.assertIsInstance(outcome, Completed)
+
+    def test_gated_tools_are_validated_before_any_work(self):
+        for kwargs, message in (
+            (dict(gated_tools=("Agent",), gate_bus_url="u", gate_actor="a"), "may only name"),
+            (dict(gated_tools=("Bash",)), "gate_bus_url"),
+            (self.gated(gate_command=()), "gate_command"),
+            (self.gated(auth="login"), "safe mode does not run hooks"),
+        ):
+            with self.subTest(message=message):
+                kwargs.setdefault("auth", "api-key")
+                with self.assertRaisesRegex(ValueError, message):
+                    self.executor(**kwargs)
+
+    def test_gated_login_refuses_user_rules_that_already_allow_a_gated_tool(self):
+        (self.config / "settings.json").write_text(json.dumps(
+            {"permissions": {"allow": ["Read(./**)", "Bash(npm test:*)"]}}))
+        with self.assertRaisesRegex(ValueError, "without the approval gate"):
+            self.executor(**self.gated(auth="login", load_user_config=True))
+        (self.config / "settings.json").write_text(json.dumps(
+            {"permissions": {"allow": ["Read(./**)"]}}))
+        outcome, _ = self.run_one(**self.gated(auth="login", load_user_config=True))
+        self.assertIsInstance(outcome, Completed)
+        self.assertNotIn("--safe-mode", self.invocation()["argv"])
+
+    def test_worker_flag_parses_gated_tools(self):
+        args = parse_args(["--auth", "api-key", "--working-directory", str(self.work),
+                           "--gated-tools", "Bash, Edit"])
+        self.assertEqual("Bash, Edit", args.gated_tools)
+        self.assertEqual("", parse_args(["--auth", "api-key", "--working-directory",
+                                         str(self.work)]).gated_tools)
 
     def test_auth_check_sees_the_same_settings_as_the_worker(self):
         # Project settings in the worker's folder are ignored by worker runs

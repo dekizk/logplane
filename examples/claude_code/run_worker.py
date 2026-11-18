@@ -12,7 +12,9 @@ import os
 import uuid
 from pathlib import Path
 
-from examples.claude_code.claude_code_executor import AUTH_MODES, EFFORT_LEVELS, ClaudeCodeExecutor
+from examples.claude_code.claude_code_executor import (
+    AUTH_MODES, EFFORT_LEVELS, GATEABLE_TOOLS, ClaudeCodeExecutor,
+)
 from examples.openclaw.run_worker import RecordingExecutor
 from logplane.client import BusClient
 from logplane.runtime import WorkerRuntime
@@ -40,7 +42,16 @@ def parse_args(argv=None):
                              "memory instead of --safe-mode (hooks can run commands)")
     parser.add_argument("--read-only-tools", action="store_true",
                         help="allow Read, Grep and Glob in the working directory (default: no tools)")
-    parser.add_argument("--timeout", type=float, default=300.0, help="seconds per assignment")
+    parser.add_argument("--gated-tools", default="", metavar="TOOLS",
+                        help="comma-separated tools to grant behind Logplane's approval gate "
+                             f"({', '.join(GATEABLE_TOOLS)}); each call waits for a standing "
+                             "rule or `logplane approve`. With --auth login this needs "
+                             "--load-user-config")
+    parser.add_argument("--approval-wait", type=float, default=3600.0,
+                        help="seconds one gated tool call may wait for an answer before it is "
+                             "denied; this time does not count against --timeout")
+    parser.add_argument("--timeout", type=float, default=300.0,
+                        help="seconds of the agent's own time per assignment")
     parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--max-budget-usd", type=float, default=0.50,
                         help="Claude Code's own spending stop for one assignment")
@@ -65,6 +76,8 @@ def main(argv=None):
         read_only_tools=args.read_only_tools, timeout=args.timeout, max_turns=args.max_turns,
         max_budget_usd=args.max_budget_usd, telemetry_sink=telemetry,
         load_user_config=args.load_user_config,
+        gated_tools=tuple(tool.strip() for tool in args.gated_tools.split(",") if tool.strip()),
+        gate_bus_url=args.bus_url, gate_actor=args.name, approval_wait=args.approval_wait,
     )
     worker_executor = (RecordingExecutor(executor, args.record, report_key="claude_report")
                        if args.record else executor)
@@ -76,6 +89,8 @@ def main(argv=None):
         details.append(f"verified login: {executor.auth_method}")
     if args.auth == "login":
         details.append("user customizations loaded" if args.load_user_config else "safe mode")
+    if executor.gated_tools:
+        details.append("approval gate on " + ", ".join(executor.gated_tools))
     if executor.removed_variables:
         details.append("ignoring " + ", ".join(executor.removed_variables))
     print(f"[{args.name}] Claude Code worker, " + "; ".join(details), flush=True)

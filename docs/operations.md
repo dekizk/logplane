@@ -178,6 +178,75 @@ Keep decisions compact coordination data. Prompts, transcripts, and large
 artifacts belong in the separate content-addressed store and should appear in
 telemetry only as compact references.
 
+## Tool-call approvals
+
+A human decision (above) ends the attempt and starts a new one with the answer.
+A tool-call approval is the lighter form: a running attempt asks before one
+tool call, keeps its assignment while it waits, and continues with the answer.
+The task stays `started` throughout, and nothing is retried.
+
+```sh
+logplane approvals                          # what is waiting, with next-step commands
+logplane approve REQUEST_EVENT_ID           # let that one call run
+logplane deny REQUEST_EVENT_ID --reason "no force pushes"
+logplane approvals --all --workflow CORRELATION_ID   # include answered and expired
+```
+
+`REQUEST_EVENT_ID` is the `approval.requested` event shown by `approvals`. A
+request is answered at most once. A request whose attempt has since ended is
+listed as `expired`; answering it reaches nobody.
+
+Standing rules settle routine calls without you. They belong to one workflow,
+and each change replaces that workflow's whole rule set:
+
+```sh
+logplane approval-rules CORRELATION_ID                # show the current rules
+logplane approval-rules CORRELATION_ID \
+  --allow Read --allow 'Bash:git status*' --deny 'Bash:git push*' \
+  --reason "overnight run"
+logplane approval-rules CORRELATION_ID --clear --reason "back to asking"
+```
+
+A rule is `TOOL` or `TOOL:INPUT_PATTERN`, with shell-style wildcards. The input
+is one line: the command for Bash, the path for file tools, the URL for
+WebFetch. Deny rules are checked first, then allow rules; a call that no rule
+matches goes to a human. Calls settled by a rule are recorded as
+`approval.rule_applied`, so the log shows which rule let each one through.
+
+What to know before relying on it:
+
+- **Rules match text; they are not a sandbox.** `Bash:git status*` says nothing
+  about what `git` does on your machine, and an agent can spell one command
+  many ways. Allow rules are therefore literal: the pattern must match the
+  whole command, and never matches one that contains shell control characters
+  (`;`, `&`, `|`, backticks, `$(`, `${`, redirection, newlines). A spelling
+  the pattern does not cover, such as `git -C /repo status`, goes to a human;
+  add `--allow 'Bash:git -C * status'` if you want it too. A bare
+  `--allow Bash` allows every command, compound ones included.
+- **Deny rules read more broadly, on a best-effort basis.** A Bash deny pattern
+  is tried against the whole command, each part of a compound command, and
+  each part with git's global options removed, so `Bash:git push*` also denies
+  `git -C /repo push` and `cd /repo && git push`. It still reads text, not a
+  shell: a script or alias that pushes is not caught. Treat a deny rule as a
+  convenience, and keep credentials the agent should not use out of its reach.
+- **Unanswered means denied.** The gate denies when nobody answers within its
+  wait, when the bus is unreachable, or when it cannot read the call. The wait
+  is set by the worker (`--approval-wait` on the Claude Code worker).
+- **Expired requests cannot be answered.** `approve` and `deny` refuse a
+  request whose attempt has already ended, and record nothing.
+- **An agent's own name cannot approve.** The bus refuses an approval, or a
+  `logplane decide` answer, recorded under the requesting worker's actor, and
+  ignores rules that worker set. Actor names are still self-reported
+  ([trust model](architecture.md#trust-model)), so this stops an agent from
+  approving itself by mistake or through its own client; it does not stop a
+  process that deliberately publishes under another name.
+- **Approvals never change ownership.** The PM does not replay approval events.
+  Cancelling, pausing or expiring the attempt still works as usual and ends
+  the wait.
+
+[Integrating agents](integration.md#asking-before-a-tool-call) shows how a
+worker asks.
+
 ## Bounded retries and terminal failure
 
 Every new `task.created` records a replayable retry policy:

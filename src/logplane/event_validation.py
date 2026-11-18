@@ -10,6 +10,10 @@ import math
 from typing import Callable, NamedTuple, Optional, TypeGuard
 
 from logplane.limits import (
+    MAX_APPROVAL_NAME_CHARS,
+    MAX_APPROVAL_PATTERN_CHARS,
+    MAX_APPROVAL_RULES,
+    MAX_APPROVAL_SUMMARY_CHARS,
     MAX_ARTIFACT_BYTES,
     MAX_TELEMETRY_ARTIFACT_REFS,
     MAX_TELEMETRY_OBJECT_BYTES,
@@ -960,6 +964,132 @@ def _decision_made(event: _Event) -> None:
         raise EventValidationError("payload.decision must be JSON-compatible") from exc
 
 
+# -- in-attempt tool-call approvals ------------------------------------------------
+
+APPROVAL_DECISIONS = frozenset({"allow", "deny"})
+_APPROVAL_CALL_FIELDS = frozenset({
+    "task_id", "assignment_id", "worker_instance_id", "approval_id",
+    "tool_name", "summary", "input_digest",
+})
+
+
+def _require_bounded_string(payload: dict, field: str, limit: int) -> None:
+    _require_string(payload, field)
+    if len(payload[field]) > limit:
+        raise EventValidationError(
+            f"payload.{field} must not exceed {limit} characters"
+        )
+
+
+def _approval_call(event: _Event) -> None:
+    payload = event.payload
+    for field in ("assignment_id", "worker_instance_id", "approval_id", "tool_name"):
+        _require_bounded_string(payload, field, MAX_APPROVAL_NAME_CHARS * 2)
+    if len(payload["tool_name"]) > MAX_APPROVAL_NAME_CHARS:
+        raise EventValidationError(
+            f"payload.tool_name must not exceed {MAX_APPROVAL_NAME_CHARS} characters"
+        )
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or len(summary) > MAX_APPROVAL_SUMMARY_CHARS:
+        raise EventValidationError(
+            f"payload.summary must be a string of at most "
+            f"{MAX_APPROVAL_SUMMARY_CHARS} characters"
+        )
+    digest = payload.get("input_digest")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise EventValidationError(
+            "payload.input_digest must be a lowercase SHA-256 hex digest"
+        )
+    if event.actor == "pm":
+        raise EventValidationError(f"{event.topic} must be emitted by a worker")
+    if event.caused_by is None:
+        raise EventValidationError(f"{event.topic} requires caused_by")
+
+
+def _approval_requested(event: _Event) -> None:
+    if set(event.payload) != _APPROVAL_CALL_FIELDS:
+        raise EventValidationError("approval.requested has an invalid payload shape")
+    _approval_call(event)
+
+
+def _approval_rule_applied(event: _Event) -> None:
+    payload = event.payload
+    if set(payload) != _APPROVAL_CALL_FIELDS | {"decision", "rules_event_id", "rule"}:
+        raise EventValidationError("approval.rule_applied has an invalid payload shape")
+    _approval_call(event)
+    if payload.get("decision") not in APPROVAL_DECISIONS:
+        raise EventValidationError("payload.decision must be allow or deny")
+    _require_positive_int_field(payload, "rules_event_id")
+    if event.caused_by != payload["rules_event_id"]:
+        raise EventValidationError(
+            "approval.rule_applied must be caused by its rules event"
+        )
+    _require_bounded_string(payload, "rule", MAX_APPROVAL_PATTERN_CHARS * 2 + 8)
+
+
+def _approval_resolved(event: _Event) -> None:
+    payload = event.payload
+    if not {"task_id", "assignment_id", "approval_id", "decision"} <= set(payload) or (
+        set(payload) - {"task_id", "assignment_id", "approval_id", "decision", "reason"}
+    ):
+        raise EventValidationError("approval.resolved has an invalid payload shape")
+    for field in ("assignment_id", "approval_id"):
+        _require_bounded_string(payload, field, MAX_APPROVAL_NAME_CHARS * 2)
+    if payload.get("decision") not in APPROVAL_DECISIONS:
+        raise EventValidationError("payload.decision must be allow or deny")
+    if "reason" in payload:
+        _require_bounded_string(payload, "reason", MAX_APPROVAL_SUMMARY_CHARS)
+    if event.actor == "pm":
+        raise EventValidationError("approval.resolved must not be emitted by pm")
+    if event.caused_by is None:
+        raise EventValidationError("approval.resolved requires caused_by")
+
+
+def _validate_approval_rule_list(payload: dict, field: str) -> int:
+    rules = payload.get(field)
+    if not isinstance(rules, list):
+        raise EventValidationError(f"payload.{field} must be a JSON array")
+    for index, rule in enumerate(rules):
+        if (
+            not isinstance(rule, dict)
+            or "tool" not in rule
+            or set(rule) - {"tool", "input"}
+        ):
+            raise EventValidationError(f"payload.{field}[{index}] has an invalid shape")
+        for key in rule:
+            value = rule[key]
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > MAX_APPROVAL_PATTERN_CHARS
+            ):
+                raise EventValidationError(
+                    f"payload.{field}[{index}].{key} must be a non-empty pattern of "
+                    f"at most {MAX_APPROVAL_PATTERN_CHARS} characters"
+                )
+    return len(rules)
+
+
+def _approval_rules_set(event: _Event) -> None:
+    payload = event.payload
+    if set(payload) != {"allow", "deny", "reason"}:
+        raise EventValidationError("approval.rules_set has an invalid payload shape")
+    _require_correlation(event)
+    count = _validate_approval_rule_list(payload, "allow")
+    count += _validate_approval_rule_list(payload, "deny")
+    if count > MAX_APPROVAL_RULES:
+        raise EventValidationError(
+            f"approval.rules_set must contain at most {MAX_APPROVAL_RULES} rules"
+        )
+    _require_bounded_string(payload, "reason", MAX_APPROVAL_SUMMARY_CHARS)
+    if event.actor == "pm":
+        raise EventValidationError("approval.rules_set must not be emitted by pm")
+
+
 Validator = Callable[[_Event], None]
 
 # Topics whose payload is not tied to one existing task.
@@ -975,6 +1105,7 @@ _PAYLOAD_VALIDATORS: dict[str, Validator] = {
     "workflow.usage_recorded": _usage_recorded,
     "workflow.paused": _workflow_control_applied,
     "workflow.resumed": _workflow_control_applied,
+    "approval.rules_set": _approval_rules_set,
 }
 
 # Task-scoped topics; validate_event checks payload.task_id before these run.
@@ -998,4 +1129,7 @@ _TASK_VALIDATORS: dict[str, Validator] = {
     "task.retry_requested": _task_retry_requested,
     "decision.needed": _decision_needed,
     "decision.made": _decision_made,
+    "approval.requested": _approval_requested,
+    "approval.rule_applied": _approval_rule_applied,
+    "approval.resolved": _approval_resolved,
 }
