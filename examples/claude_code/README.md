@@ -95,7 +95,8 @@ are denied, not run.
   denied. Raise `--max-turns` and `--max-budget-usd` for multi-step work.
 - **Tried live with `--auth login --load-user-config`** (see the
   [trial notes](TRIAL_NOTES.md)): the hook loaded, approvals were honoured
-  under `dontAsk`, and the same attempt continued. `--auth api-key` (`--bare`)
+  under `dontAsk`, the same attempt continued after each answer, an
+  unanswered call was denied, and a deny rule stopped `git push`. `--auth api-key` (`--bare`)
   has stand-in coverage only; whether a hook passed with `--settings` runs in
   bare mode is still to be confirmed. If it does not, gated calls are denied.
 

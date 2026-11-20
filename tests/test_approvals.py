@@ -504,6 +504,14 @@ class ApprovalCliTests(ApprovalStorageCase):
         self.assertEqual(["allowed", "denied"], [row["status"] for row in json.loads(out)["approvals"]])
         self.assertEqual(["human", "human"], [row["resolved_by"] for row in json.loads(out)["approvals"]])
 
+    def test_an_empty_workflow_filter_is_an_error_not_a_silent_no_op(self):
+        self.request()
+        code, out, err = self.run_cli("approvals", "--workflow", "")
+        self.assertEqual((2, ""), (code, out))
+        self.assertIn("--workflow is empty", err)
+        rows = json.loads(self.run_cli("approvals", "--workflow", self.workflow, "--json")[1])
+        self.assertEqual(1, len(rows["approvals"]))
+
     def test_refusals_are_explained(self):
         request = self.request()
         self.assertEqual(0, self.run_cli("approve", str(request["id"]))[0])
