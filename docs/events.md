@@ -120,6 +120,17 @@ replay:
 |---|---|---|
 | `integration.task_observed` | bridge | Records externally owned shadow or unselected canary work |
 
+Approval topics record [tool-call approvals](operations.md#tool-call-approvals).
+They are validated and deliberately excluded from PM replay: an approval never
+changes task state or ownership.
+
+| Topic | Emitted by | Purpose |
+|---|---|---|
+| `approval.requested` | worker | Asks a human before one tool call of the worker's current attempt |
+| `approval.resolved` | human | Allows or denies one request; never the requesting worker, at most once |
+| `approval.rule_applied` | worker | Records that a standing rule settled a call, and which rule |
+| `approval.rules_set` | human | Replaces one workflow's standing allow and deny rules |
+
 Telemetry topics are also validated and deliberately excluded from PM replay:
 
 | Topic | Purpose |
@@ -131,9 +142,9 @@ Telemetry topics are also validated and deliberately excluded from PM replay:
 | `telemetry.tool.completed` | Records tool duration and optional artifact refs |
 | `telemetry.tool.failed` | Records a typed retryable/permanent tool failure |
 
-`topics.py` is the canonical source for all three groups. Tests assert that the
-PM uses exactly the coordination group and never consumes integration or
-telemetry topics. `validate_event()` in `bus.py` is the canonical built-in
+`topics.py` is the canonical source for all four groups. Tests assert that the
+PM uses exactly the coordination group and never consumes integration,
+approval or telemetry topics. `validate_event()` in `bus.py` is the canonical built-in
 payload validator; `tests/test_bus.py` records its compatibility and rejection
 behavior. Keep those sources authoritative instead of treating this compact
 README table as a separately maintained exhaustive schema.
@@ -149,6 +160,8 @@ README table as a separately maintained exhaustive schema.
 | Telemetry `attributes` or model `usage` object | 8 KiB encoded JSON each |
 | Artifact references on one telemetry event | 16 |
 | One content-addressed artifact | 16 MiB |
+| Approval summary shown to a human | 500 characters (the whole input is digested) |
+| Standing approval rules per workflow | 100, each pattern at most 200 characters |
 | Correlation, producer, telemetry identity, and external-origin fields | 128 characters where applicable |
 
 These are coordination safety boundaries, not a transport for large model

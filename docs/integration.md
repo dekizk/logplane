@@ -225,6 +225,40 @@ external side effect atomic. `logplane demo approval` and
 `logplane demo audit-triage` show effect keys preventing repeated refunds and
 submissions across retries.
 
+### Asking before a tool call
+
+An executor can put individual tool calls behind a
+[tool-call approval](operations.md#tool-call-approvals) while its attempt keeps
+running:
+
+```python
+from logplane.approvals import ApprovalGate
+
+class ExistingAgent:
+    def __init__(self, bus):
+        self.bus = bus  # the worker's own BusClient
+
+    def run(self, assignment):
+        gate = ApprovalGate.for_assignment(self.bus, assignment, wait_seconds=1800)
+        answer = gate.check("Bash", {"command": "git push origin main"})
+        if not answer.allowed:
+            return Blocked(f"push was not approved: {answer.reason}")
+        ...
+```
+
+`check` blocks until a standing rule or a human settles the call, and returns a
+denial instead of raising when the bus is unreachable or nobody answers in
+time. Pass the agent's own tool-call id as `call_id` when it has one, so a
+repeated check of the same call is idempotent.
+
+Agents that run as a separate program use a hook instead.
+`logplane gate claude-hook` is a Claude Code `PreToolUse` command hook: the
+worker passes the attempt in `LOGPLANE_GATE_*` variables
+(`logplane.gate.gate_environment`), and the hook prints the permission decision.
+The [Claude Code example](../examples/claude_code/README.md) wires it up behind
+`--gated-tools`. `ApprovalGate` and the hook are new in this release and are
+not yet part of the stable `logplane` import surface.
+
 ## Telemetry and artifacts
 
 Raw telemetry is observational and is never consumed by the PM. Model and tool

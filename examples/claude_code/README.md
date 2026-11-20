@@ -59,8 +59,8 @@ policy-configured hooks; this adapter cannot switch those off.
 
 By default, nothing but answer: built-in tools are off (`--tools ""`), MCP tools
 and slash commands are disabled, anything that would need approval is denied
-(`--permission-mode dontAsk`), and the session is not saved. Claude is never
-given tools to edit files or run commands. (In login mode with
+(`--permission-mode dontAsk`), and the session is not saved. Claude is given
+tools to edit files or run commands only through `--gated-tools`, below. (In login mode with
 `--load-user-config`, your own hooks can still run commands, as above.)
 
 With `--read-only-tools`, Claude may also use Read, Grep and Glob, which suits
@@ -77,6 +77,28 @@ to start if it finds either:
 Managed policy can still grant more, and the check covers only your user
 settings file. For material that must not leave a folder, use `--auth api-key`
 on a copy of just that folder.
+
+With `--gated-tools Bash,Edit` (any of Bash, Edit, MultiEdit, Write,
+NotebookEdit, WebFetch, WebSearch), Claude gets those tools behind Logplane's
+[tool-call approvals](../../docs/operations.md#tool-call-approvals). The worker
+passes a `PreToolUse` hook with `--settings`; each call to a gated tool waits
+for a standing rule or for `logplane approve` / `logplane deny`, and the run
+continues with the answer. The permission mode stays `dontAsk`, so a gated tool
+runs only when the hook allows that call: if the hook does not load, the calls
+are denied, not run.
+
+- Hooks do not run in safe mode, so with `--auth login` this needs
+  `--load-user-config`, which also loads your other customizations. The worker
+  refuses to start if your user settings already allow a gated tool.
+- Time spent waiting for an answer does not count against `--timeout`. One
+  call waits at most `--approval-wait` seconds (default 3600) and is then
+  denied. Raise `--max-turns` and `--max-budget-usd` for multi-step work.
+- **Tried live with `--auth login --load-user-config`** (see the
+  [trial notes](TRIAL_NOTES.md)): the hook loaded, approvals were honoured
+  under `dontAsk`, the same attempt continued after each answer, an
+  unanswered call was denied, and a deny rule stopped `git push`. `--auth api-key` (`--bare`)
+  has stand-in coverage only; whether a hook passed with `--settings` runs in
+  bare mode is still to be confirmed. If it does not, gated calls are denied.
 
 Each call is bounded by a worker timeout, a turn limit (`--max-turns`, default
 4), and Claude Code's own spending stop (`--max-budget-usd`, default $0.50).

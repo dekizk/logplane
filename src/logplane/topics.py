@@ -51,4 +51,18 @@ TELEMETRY_TOPICS = frozenset(
     }
 )
 
-KNOWN_TOPICS = COORDINATION_TOPICS | INTEGRATION_TOPICS | TELEMETRY_TOPICS
+# In-attempt approval of individual tool calls. Deliberately outside the
+# coordination topics: the PM never replays these, an approval never changes
+# task ownership, and the running attempt keeps its assignment while it waits.
+APPROVAL_TOPICS = frozenset(
+    {
+        "approval.requested",
+        "approval.resolved",
+        "approval.rule_applied",
+        "approval.rules_set",
+    }
+)
+
+KNOWN_TOPICS = (
+    COORDINATION_TOPICS | INTEGRATION_TOPICS | TELEMETRY_TOPICS | APPROVAL_TOPICS
+)

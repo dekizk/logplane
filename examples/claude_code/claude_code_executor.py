@@ -22,6 +22,15 @@ and slash commands are disabled, anything that would need approval is denied,
 and the session is not saved. Logplane owns retries; this adapter never asks
 Claude Code to resume a session. Organization-managed settings still apply in
 every mode; this adapter cannot switch those off.
+
+``gated_tools`` is the one way to grant tools that act on the machine (Bash,
+Edit, Write and so on). Each call to one then goes through Logplane's approval
+gate (``logplane gate claude-hook``, a ``PreToolUse`` hook passed with
+``--settings``): a standing rule or a human settles it while the run waits.
+The permission mode stays ``dontAsk``, so a gated tool runs only when the hook
+allows that call; if the hook does not load, the calls are denied, not run.
+Hooks do not run in safe mode, so with ``login`` this needs
+``load_user_config``, which also loads your other customizations.
 """
 
 from __future__ import annotations
@@ -30,8 +39,10 @@ import json
 import math
 import os
 import selectors
+import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -43,6 +54,7 @@ from logplane.executors import (
     AssignmentContext, Outcome, PermanentFailure, RetryableFailure,
     json_size, outcome_from_dict,
 )
+from logplane.gate import WAITING_DIRECTORY, approval_pending, gate_environment
 from logplane.limits import MAX_INLINE_RESULT_BYTES
 
 AUTH_MODES = ("login", "api-key")
@@ -59,12 +71,18 @@ LOGIN_TOKEN_VARIABLES = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_T
                          "CLAUDE_CODE_OAUTH_SCOPES")
 # What each run's init message must report as its credential source.
 EXPECTED_KEY_SOURCE = {"login": "none", "api-key": "ANTHROPIC_API_KEY"}
-# Tools that act on the machine or the network. None is ever granted; a run
-# that reports one anyway is discarded.
+# Tools that act on the machine or the network. None is granted unless it is
+# named in ``gated_tools``; a run that reports any other is discarded.
 FORBIDDEN_TOOLS = frozenset({
     "Bash", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write", "NotebookEdit",
     "WebFetch", "WebSearch", "Agent", "Task",
 })
+
+
+# What ``gated_tools`` may name, and the companions Claude Code adds with them.
+GATEABLE_TOOLS = ("Bash", "Edit", "MultiEdit", "Write", "NotebookEdit", "WebFetch", "WebSearch")
+GATED_COMPANIONS = {"Bash": ("BashOutput", "KillShell")}
+DEFAULT_GATE_COMMAND = (sys.executable, "-m", "logplane", "gate", "claude-hook")
 
 
 def conflicting_auth_variables(environment: dict, auth: str) -> list[str]:
@@ -137,6 +155,22 @@ def widening_read_rules(settings_path: Path) -> list[str]:
     return found
 
 
+def ungated_allow_rules(settings_path: Path, gated_tools: tuple[str, ...]) -> list[str]:
+    """User-level allow rules that would let a gated tool run without the gate."""
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not read {settings_path} to check tool permissions") from exc
+    permissions = settings.get("permissions") if isinstance(settings, dict) else None
+    if not isinstance(permissions, dict):
+        return []
+    names = set(gated_tools) | {"*"}
+    return [f"permissions.allow {rule!r}" for rule in permissions.get("allow") or []
+            if isinstance(rule, str) and rule.split("(", 1)[0].strip() in names]
+
+
 def outside_symlinks(directory: Path, limit: int = MAX_SCANNED_ENTRIES) -> list[str]:
     """Symlinks under ``directory`` that resolve outside it (first few)."""
     found, seen = [], 0
@@ -181,10 +215,20 @@ INSTRUCTION = "Complete the Logplane assignment given on standard input."
 
 
 def build_prompt(assignment: AssignmentContext, *, read_only_tools: bool,
-                 structured_result: bool = False) -> str:
+                 structured_result: bool = False,
+                 gated_tools: tuple[str, ...] = ()) -> str:
     tools = ("You may read files in the working directory with Read, Grep and Glob. "
-             "You cannot edit files or run commands. " if read_only_tools
-             else "Tools are disabled for this assignment. ")
+             if read_only_tools else "")
+    if gated_tools:
+        tools += ("You may use " + ", ".join(gated_tools) + ". Every call to one of these "
+                  "is checked first by the operator's approval gate and may wait for a "
+                  "human; a denial is final for that call, so do not retry it or work "
+                  "around it. If you cannot finish without a denied call, report blocked "
+                  "and say what you need. ")
+    elif read_only_tools:
+        tools += "You cannot edit files or run commands. "
+    else:
+        tools = "Tools are disabled for this assignment. "
     return (
         "Logplane owns scheduling, retries, dependencies, and task state. "
         "Execute only this assignment. Do not delegate or schedule work. " + tools +
@@ -258,7 +302,8 @@ def _stream_messages(stdout: bytes) -> tuple[Optional[dict], Optional[dict]]:
 
 
 def parse_result(returncode: int, stdout: bytes, *,
-                 expected_key_source: Optional[str] = None) -> tuple[Outcome, dict]:
+                 expected_key_source: Optional[str] = None,
+                 granted_tools: frozenset = frozenset()) -> tuple[Outcome, dict]:
     """Map Claude Code's stream-json output to an outcome, plus a separate report.
 
     The init message must report ``expected_key_source`` as its credential
@@ -298,8 +343,8 @@ def parse_result(returncode: int, stdout: bytes, *,
                 "claude_wrong_auth",
                 f"Claude Code used credential source {init.get('apiKeySource')!r}, "
                 f"expected {expected_key_source!r}; outcome discarded"), report
-        unexpected = sorted(t for t in report["tools"]
-                            if t.startswith("mcp__") or t in FORBIDDEN_TOOLS)
+        unexpected = sorted(t for t in report["tools"] if t.startswith("mcp__")
+                            or (t in FORBIDDEN_TOOLS and t not in granted_tools))
         if unexpected:
             return PermanentFailure(
                 "claude_unexpected_tools",
@@ -371,7 +416,10 @@ class ClaudeCodeExecutor:
                  max_budget_usd: float = 0.50, telemetry_sink=None,
                  environment: Optional[dict] = None, load_user_config: bool = False,
                  verify_auth: bool = True, result_schema: Optional[dict] = None,
-                 max_prompt_bytes: int = MAX_PROMPT_BYTES):
+                 max_prompt_bytes: int = MAX_PROMPT_BYTES, gated_tools: tuple[str, ...] = (),
+                 gate_bus_url: Optional[str] = None, gate_actor: Optional[str] = None,
+                 gate_command: tuple[str, ...] = DEFAULT_GATE_COMMAND,
+                 approval_wait: float = 3600):
         if auth not in AUTH_MODES:
             raise ValueError(f"auth must be one of {', '.join(AUTH_MODES)}")
         if not command or not all(isinstance(item, str) and item for item in command):
@@ -382,12 +430,29 @@ class ClaudeCodeExecutor:
             raise ValueError("max_turns must be a positive integer")
         if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
             raise ValueError("max_budget_usd must be finite and positive")
+        if not math.isfinite(approval_wait) or approval_wait <= 0:
+            raise ValueError("approval_wait must be finite and positive")
         if effort is not None and effort not in EFFORT_LEVELS:
             raise ValueError(f"effort must be one of {', '.join(EFFORT_LEVELS)}")
         if model is not None and not model.strip():
             raise ValueError("model must not be empty")
         if load_user_config and auth != "login":
             raise ValueError("load_user_config applies only to --auth login")
+        gated_tools = tuple(dict.fromkeys(gated_tools))
+        unknown = [tool for tool in gated_tools if tool not in GATEABLE_TOOLS]
+        if unknown:
+            raise ValueError("gated_tools may only name " + ", ".join(GATEABLE_TOOLS) +
+                             "; got " + ", ".join(map(str, unknown)))
+        if gated_tools:
+            if not gate_bus_url or not gate_actor:
+                raise ValueError("gated_tools needs gate_bus_url and gate_actor, the bus "
+                                 "and worker name the approval gate reports to")
+            if not gate_command or not all(isinstance(item, str) and item for item in gate_command):
+                raise ValueError("gate_command must contain executable arguments")
+            if auth == "login" and not load_user_config:
+                raise ValueError(
+                    "--gated-tools with --auth login needs --load-user-config: the approval "
+                    "gate is a hook, and safe mode does not run hooks")
         base = dict(os.environ if environment is None else environment)
         self.removed_variables: list[str] = []
         self.auth_method: Optional[str] = None
@@ -414,6 +479,16 @@ class ClaudeCodeExecutor:
             if links:
                 raise ValueError("--read-only-tools: these symlinks point outside the working "
                                  "directory: " + ", ".join(links))
+        if gated_tools and auth == "login":
+            rules = ungated_allow_rules(_user_settings_path(base), gated_tools)
+            if rules:
+                raise ValueError(
+                    "--gated-tools: your Claude Code user settings already allow a gated "
+                    "tool, which would let it run without the approval gate if the hook "
+                    "failed to load (" + "; ".join(rules) + "). Remove them first")
+        self.gated_tools, self.gate_command = gated_tools, tuple(gate_command)
+        self.approval_wait = approval_wait
+        self.gate_bus_url, self.gate_actor = gate_bus_url, gate_actor
         self.auth, self.command, self.model, self.effort = auth, tuple(command), model, effort
         self.load_user_config = load_user_config
         self.result_schema = result_schema
@@ -434,6 +509,19 @@ class ClaudeCodeExecutor:
                     "Remove it, or use --auth api-key")
             self.auth_method = method
 
+    def granted_tools(self) -> list[str]:
+        return ([*READ_ONLY_TOOLS.split(",")] if self.read_only_tools else []) + [*self.gated_tools]
+
+    def gate_settings(self) -> dict:
+        """The settings that put every gated tool call behind the approval gate."""
+        return {"hooks": {"PreToolUse": [{
+            "matcher": "|".join(self.gated_tools),
+            # The gate itself gives up after approval_wait; the hook's own
+            # limit only has to outlast that.
+            "hooks": [{"type": "command", "command": shlex.join(self.gate_command),
+                       "timeout": math.ceil(self.approval_wait) + 60}],
+        }]}}
+
     def argv(self) -> list[str]:
         argv = [*self.command]
         if self.auth == "api-key":
@@ -442,7 +530,7 @@ class ClaudeCodeExecutor:
                  "--output-format", "stream-json", "--verbose",
                  "--json-schema", json.dumps(outcome_schema(self.result_schema),
                                              separators=(",", ":")),
-                 "--tools", READ_ONLY_TOOLS if self.read_only_tools else "",
+                 "--tools", ",".join(self.granted_tools()),
                  "--disallowedTools", "mcp__*",
                  "--permission-mode", "dontAsk",
                  "--strict-mcp-config",
@@ -454,6 +542,8 @@ class ClaudeCodeExecutor:
             argv += ["--setting-sources", "user"]
             if not self.load_user_config:
                 argv.append("--safe-mode")
+        if self.gated_tools:
+            argv += ["--settings", json.dumps(self.gate_settings(), separators=(",", ":"))]
         if self.model:
             argv += ["--model", self.model]
         if self.effort:
@@ -482,7 +572,8 @@ class ClaudeCodeExecutor:
 
     def _execute(self, assignment: AssignmentContext, cancelled: threading.Event) -> Outcome:
         prompt = build_prompt(assignment, read_only_tools=self.read_only_tools,
-                              structured_result=self.result_schema is not None)
+                              structured_result=self.result_schema is not None,
+                              gated_tools=self.gated_tools)
         if len(prompt.encode()) > self.max_prompt_bytes:
             return PermanentFailure("claude_prompt_too_large", "Assignment exceeds the prompt limit")
         if cancelled.is_set():
@@ -494,7 +585,14 @@ class ClaudeCodeExecutor:
                         provider=provider, model=requested_model,
                         attributes={"adapter": "examples.claude_code", "auth": self.auth})
         started = time.monotonic()
-        outcome, report = self._run(prompt, cancelled)
+        environment = self.environment
+        if self.gated_tools:
+            environment = {**environment, **gate_environment(
+                assignment, bus_url=self.gate_bus_url, actor=self.gate_actor,
+                wait_seconds=self.approval_wait)}
+        outcome, report = self._run(prompt, cancelled, environment)
+        if self.gated_tools:
+            report["gated_tools"] = list(self.gated_tools)
         report["auth"] = self.auth
         if self.auth_method:
             report["auth_method"] = self.auth_method
@@ -517,26 +615,42 @@ class ClaudeCodeExecutor:
                             retryable=isinstance(outcome, RetryableFailure), usage=usage)
         return outcome
 
-    def _run(self, prompt: str, cancelled: threading.Event) -> tuple[Outcome, dict]:
+    def _run(self, prompt: str, cancelled: threading.Event,
+             environment: Optional[dict] = None) -> tuple[Outcome, dict]:
         with tempfile.TemporaryDirectory(prefix="logplane-claude-") as directory:
             prompt_path = Path(directory) / "prompt.txt"
             prompt_path.write_text(prompt, encoding="utf-8")
+            waiting: Optional[Path] = None
+            if self.gated_tools:
+                # Gate hooks leave a marker here while they wait for an answer.
+                waiting = Path(directory) / "waiting"
+                waiting.mkdir()
+                environment = {**(self.environment if environment is None else environment),
+                               WAITING_DIRECTORY: str(waiting)}
             try:
                 with prompt_path.open("rb") as stdin:
                     process = subprocess.Popen(
-                        self.argv(), cwd=self.directory, env=self.environment, stdin=stdin,
+                        self.argv(), cwd=self.directory,
+                        env=self.environment if environment is None else environment,
+                        stdin=stdin,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
                     )
             except OSError:
                 return PermanentFailure("claude_start_failed", "Could not start the Claude Code command"), {}
             output = bytearray()
             deadline = time.monotonic() + self.timeout
+            last_tick = time.monotonic()
             try:
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     while selector.get_map() or process.poll() is None:
                         if cancelled.is_set():
                             return RetryableFailure("claude_cancelled", "Assignment ownership was revoked"), {}
+                        tick = time.monotonic()
+                        if waiting is not None and approval_pending(waiting):
+                            # Time spent waiting for a human is not the agent's.
+                            deadline += tick - last_tick
+                        last_tick = tick
                         if time.monotonic() >= deadline:
                             return RetryableFailure("claude_timeout", "Claude Code exceeded the worker timeout"), {}
                         for key, _ in selector.select(timeout=0.05):
@@ -548,8 +662,12 @@ class ClaudeCodeExecutor:
                                 return PermanentFailure("claude_output_too_large",
                                                         "Claude Code exceeded the output limit"), {}
                             output.extend(chunk)
+                granted = set(self.gated_tools)
+                for tool in self.gated_tools:
+                    granted.update(GATED_COMPANIONS.get(tool, ()))
                 return parse_result(process.returncode, bytes(output),
-                                    expected_key_source=EXPECTED_KEY_SOURCE[self.auth])
+                                    expected_key_source=EXPECTED_KEY_SOURCE[self.auth],
+                                    granted_tools=frozenset(granted))
             except OSError:
                 return RetryableFailure("claude_io_error", "Claude Code output could not be read"), {}
             finally:

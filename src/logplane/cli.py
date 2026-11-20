@@ -76,6 +76,15 @@ def build_parser() -> argparse.ArgumentParser:
             control.add_argument('--value', required=True, help='JSON decision value (quote text as a JSON string)')
         _add_common_options(control)
 
+    from logplane import approval_cli
+    approval_cli.add_parsers(commands, add_common_options=_add_common_options,
+                             positive_int=_positive_int)
+    gate = commands.add_parser(
+        "gate", help="hook entry points that ask before an agent's tool call")
+    gate_commands = gate.add_subparsers(dest="gate_command", required=True)
+    gate_commands.add_parser(
+        "claude-hook", help="Claude Code PreToolUse hook; reads the call on stdin")
+
     doctor = commands.add_parser(
         "doctor", help="check the bus and local coordination view"
     )
@@ -414,6 +423,9 @@ def main(
             keep_running=args.keep_running,
             read_pauses=args.read_pauses,
         )
+    if args.command == "gate":
+        from logplane import gate
+        return gate.run_claude_hook(sys.stdin, stdout, os.environ)
     if args.command in {
         "init", "up", "serve", "pm", "demo-worker", "submit", "pause", "resume",
         "supersede", "policy", "agent-policy", "adapter", "rebuild-task-index", "snapshot",
@@ -470,6 +482,10 @@ def main(
                            f"{value['message']}\nTask state at event #{value['observed_through_id']}: {value['task_status']}\n"
                            f"Next: {shlex.join(value['next_action'])}")
             return 0 if value['accepted'] else 4
+        elif args.command in {"approvals", "approve", "deny", "approval-rules"}:
+            from logplane import approval_cli
+            return approval_cli.run(args, client, stdout=stdout, stderr=stderr,
+                                    clock=clock, render=_render_simple)
         elif args.command == "doctor":
             value = _doctor(client, now=clock(), lease_seconds=args.lease_seconds)
             _render(value, args, stdout, _format_doctor)
