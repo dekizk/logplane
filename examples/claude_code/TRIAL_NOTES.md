@@ -1,5 +1,42 @@
 # Claude Code trial notes
 
+## 2026-11-20 — tool-call approvals after the fixes, `--auth login --load-user-config`
+
+Result: **passed every check.** Waiting for an answer no longer used up the
+agent's time, an unanswered call was denied and Claude stopped cleanly, a deny
+rule stopped `git push` with no prompt, and an expired request could not be
+answered.
+
+Setup: commit `6109b11`, Claude Code through the user's Claude login with
+`--load-user-config`, `--gated-tools Bash,Write,Edit --timeout 300
+--approval-wait 900 --max-turns 15`, a fresh scratch repository with no remote,
+tasks submitted with `--max-retries 2`. Rules on each workflow: allow
+`Bash:git status*` and `Bash:git -C * status`, deny `Bash:git push*`.
+
+| Check | Task | Result |
+|---|---|---|
+| A wait longer than `--timeout` does not end the attempt | 19 | Write request #6191 approved after 428 s, past the 300 s timeout; the same attempt continued |
+| A standing allow rule settles a call | 19, 20 | `git status` ran with no request |
+| An unanswered call is denied | 19 | `git add` (#6412) denied after 900 s; Claude did not retry it, reported `blocked`, and listed every call accurately |
+| An expired request cannot be answered | 17, 19 | `logplane approve 4712` and `logplane approve 6412` refused with "has expired"; nothing recorded |
+| Human approvals continue the same attempt | 20 | `cat`, `git add`, `git commit` approved one by one; commit `f868c02 gate trial` landed |
+| A deny rule stops a call with no prompt | 20 | `git push origin main` denied by `Bash:git push*` (rules event #6185); Claude reported `blocked` and asked whether to allow the push |
+
+Every task ended on attempt 1. Claude treated a denial as final each time and
+named the rule or timeout that stopped it.
+
+Friction: `logplane approvals --workflow "$CID"` with `$CID` unset in that
+shell listed every workflow instead of failing; an empty `--workflow` is now an
+error. Answering promptly is still on the operator: with requests arriving one
+at a time, a `while` loop over `logplane approvals` was the easiest way to
+watch.
+
+### Not yet shown
+
+- `--gated-tools` with `--auth api-key` (`--bare`): whether a hook passed with
+  `--settings` runs in bare mode.
+- An unattended overnight run relying on standing rules and `--approval-wait`.
+
 ## 2026-11-17 — tool-call approvals, `--auth login --load-user-config`
 
 Result: **the approval gate worked against Claude Code.** The hook loaded,

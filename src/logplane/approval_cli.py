@@ -85,6 +85,11 @@ def _publish(args, intent: dict) -> dict:
 def _list(args, client, *, stdout, clock, render) -> int:
     from logplane.operator_controls import read_snapshot
 
+    if args.workflow is not None and not args.workflow.strip():
+        # Usually an unset shell variable; ignoring it would list every workflow.
+        raise ValueError("--workflow is empty; pass a correlation ID "
+                         "(`logplane workflows` lists them)")
+
     state, head, _, _, _ = read_snapshot(client)
     events = list(client.iter_events(through_id=head, topics=sorted(APPROVAL_TOPICS)))
     active = {

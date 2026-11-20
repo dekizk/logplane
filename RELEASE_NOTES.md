@@ -17,8 +17,8 @@
   answer does not count against the worker's `--timeout`. Deny rules for Bash
   also match each part of a compound command and see through git's global
   options, while allow rules stay literal. `--gated-tools` has been run live
-  with `--auth login --load-user-config`; `--auth api-key` has stand-in
-  coverage only.
+  with `--auth login --load-user-config`, including a rule denial and an
+  unanswered call; `--auth api-key` has stand-in coverage only.
 - **An agent's own name can no longer answer its own question.** The bus now
   refuses a `decision.made`, or an approval, recorded under the actor of the
   worker that asked. This applies to new events only; existing histories
