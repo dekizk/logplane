@@ -24,6 +24,23 @@
   worker that asked. This applies to new events only; existing histories
   replay as before. Actor names remain self-reported, so this is a guard, not
   authentication.
+- **New example: a multi-model contest hunt.** `examples/contest_hunt/` runs a
+  bug bounty contest as a Logplane workflow. One model maps the in-scope changes
+  into hunting areas, every hunter model reviews every area, and one model
+  triages the candidates against the code, the rules and the known issues into
+  a ranked report. Workers are Claude Code (read-only tools), Codex (read-only
+  sandbox) and Hermes (no tools, material given inline), so each stage can use
+  a different model. Includes the Templar Precept contest as a worked example.
+  Nothing is ever submitted to a contest.
+- **New example: Codex as a Logplane worker.** `examples/codex/` runs one
+  `codex exec` turn per assignment with your ChatGPT login, in a read-only
+  sandbox, without user config, rules or saved sessions. It checks the login
+  before accepting work, removes API keys and endpoints from Codex's
+  environment, discards runs that changed files or called MCP tools, and
+  reports token usage to Logplane.
+- The Claude Code and Hermes executors gain optional `max_prompt_bytes`, and
+  the Claude Code executor an optional `result_schema` for structured results.
+  Defaults are unchanged.
 - **New example: Claude Code as a Logplane worker.** `examples/claude_code/`
   runs one non-interactive `claude -p` turn per assignment. You choose how it
   authenticates. `--auth login` uses your Claude Code login in `--safe-mode`,
