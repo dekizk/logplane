@@ -36,8 +36,47 @@ What the runs changed:
 - A refusal by OpenAI's cyber safeguards is reported as `codex_safety_refusal`.
 - Codex's own error output is kept, so an early exit says why.
 
+## 2026-11-22 — Precept full hunt and gap-filling runs
+
+Same setup as the pilot. Hunters: fable (`claude-fable-5-2`), astra (Codex
+`gpt-5.6-sol` with Daybreak), opus and glm; triage on astra.
+
+| Run | Scope | Result |
+|---|---|---|
+| Full run | map, then 10 areas × 4 hunters (40 hunts), triage | Map done in 5.7 min. 32 hunts completed, 8 failed. 3 candidates, all from glm; triage rejected all 3 |
+| fable-1 | fable on seed areas A05–A07 | 3 completed, 0 candidates (about $18 est.) |
+| fable-2 | fable on A08–A10 | 3 completed, 0 candidates (about $14 est.) |
+| opus-a10 | opus on A10 | Completed, 0 candidates |
+| glm-a05 | glm on A05 | Failed again: malformed JSON about 3,000 characters in |
+| astra-ultra | astra on all 10 seed areas at `ultra` effort, timeout 3600 | 10 completed, 0 candidates; 1.9 to 4.8 million tokens per area, against about 1.3 million at `high` |
+
+Failures in the full run:
+
+- Seven Claude hunts (fable on A05–A10, opus on A10) hit the Claude plan's
+  5-hour usage limit. Each failed permanently in turn, about 40 minutes in,
+  and the gaps had to be refilled by hand after the limit reset.
+- glm on A05 returned malformed JSON, in this run and in its own rerun.
+
+Coverage at the end: every area by fable, opus and astra (at two efforts), and
+nine of ten by glm. No Critical candidate survived triage. The gap-filling
+runs used the contest's seed areas, which differ a little from the areas the
+map produced, so coverage does not line up exactly.
+
+Four hunts ran at a time under the workflow's default concurrency of 4. No lease
+expiries, crashes or stale results in any run.
+
+What this asks of Logplane:
+
+- **A usage limit should be retried after it resets**, not ended as a
+  permanent failure. The message names the reset time, so the adapter could
+  report a retryable failure with a matching delay. This is the retry backoff
+  item in the reliability list.
+- **One retry for a malformed model answer** may be worth having; it would not
+  have saved glm on A05, which failed the same way twice.
+- **Rerunning one stage** (triage, or a list of hunts) without a full run
+  would have saved the gap-filling runs.
+
 ### Not yet shown
 
-- A triage pass over real candidates.
-- The map stage and a full run across all ten seed areas.
-- A way to rerun triage alone after it fails.
+- A triage pass that accepts a candidate.
+- Rerunning triage alone after it fails.
