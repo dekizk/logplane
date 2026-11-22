@@ -11,6 +11,12 @@ from commands), `--ignore-user-config` and `--ignore-rules` (no MCP servers,
 hooks, profiles or exec-policy rules from your config), and `--ephemeral` (no
 saved session). The run's event stream is checked afterwards: a run that changed
 files or called MCP tools is discarded.
+
+``daybreak=True`` asks for OpenAI's Daybreak (Trusted Access for Cyber) handling
+on each run with ``-c daybreak=true``. It needs Codex CLI 0.163.0 or later and an
+account approved for Daybreak; your Codex config file is never read, so the
+setting must come from here. A request OpenAI's cyber safeguards still refuse is
+reported as ``codex_safety_refusal``.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import selectors
 import subprocess
 import tempfile
@@ -78,6 +85,28 @@ def _switches_auth(name: str) -> bool:
         "CODEX_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"})
 
 
+DAYBREAK_MIN_VERSION = (0, 163, 0)
+_SAFETY_REFUSAL = "flagged for possible cybersecurity risk"
+
+
+def check_daybreak_version(command: tuple[str, ...], environment: dict) -> str:
+    """The Codex CLI version, which must support the ``daybreak`` setting."""
+    try:
+        done = subprocess.run([*command, "--version"], env=environment, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"could not run `codex --version`: {type(exc).__name__}") from exc
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", done.stdout + done.stderr)
+    if done.returncode != 0 or found is None:
+        raise ValueError("could not read the Codex version from `codex --version`")
+    version = tuple(int(part) for part in found.groups())
+    if version < DAYBREAK_MIN_VERSION:
+        raise ValueError("daybreak needs Codex CLI "
+                         + ".".join(map(str, DAYBREAK_MIN_VERSION))
+                         + f" or later; this is {found.group(0)}. Update Codex")
+    return found.group(0)
+
+
 def check_login_status(command: tuple[str, ...], environment: dict) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix="logplane-codex-auth-") as empty:
@@ -136,6 +165,11 @@ def parse_events(returncode: int, stdout: bytes) -> tuple[Outcome, dict]:
                                 "; outcome discarded"), report
     if errors or returncode != 0:
         detail = _brief(errors[-1] if errors else f"exit {returncode}")
+        if any(_SAFETY_REFUSAL in str(error) for error in errors):
+            report["safety_refusal"] = True
+            return PermanentFailure(
+                "codex_safety_refusal",
+                f"OpenAI's cyber safeguards refused this request: {detail}"), report
         return PermanentFailure("codex_failed", f"Codex failed: {detail}"), report
     if not isinstance(final, str):
         return PermanentFailure("codex_no_outcome", "Codex finished without a final message"), report
@@ -166,7 +200,8 @@ class CodexExecutor:
                  model: Optional[str] = None, effort: Optional[str] = None,
                  timeout: float = 1800, result_schema: Optional[dict] = None,
                  max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES, telemetry_sink=None,
-                 environment: Optional[dict] = None, verify_auth: bool = True):
+                 environment: Optional[dict] = None, verify_auth: bool = True,
+                 daybreak: bool = False):
         if not command or not all(isinstance(item, str) and item for item in command):
             raise ValueError("command must contain executable arguments")
         if not math.isfinite(timeout) or timeout <= 0:
@@ -191,6 +226,9 @@ class CodexExecutor:
         self._active: dict[str, threading.Event] = {}
         self._closed = False
         self.last_report: tuple[str, dict] | None = None
+        self.daybreak = daybreak
+        self.codex_version = (check_daybreak_version(self.command, self.environment)
+                              if daybreak else None)
         self.auth_method = check_login_status(self.command, self.environment) if verify_auth else None
 
     def argv(self, schema_path: Path) -> list[str]:
@@ -201,6 +239,8 @@ class CodexExecutor:
             argv += ["--model", self.model]
         if self.effort:
             argv += ["-c", f'model_reasoning_effort="{self.effort}"']
+        if self.daybreak:
+            argv += ["-c", "daybreak=true"]
         return argv + ["-"]
 
     def execute(self, assignment: AssignmentContext) -> Outcome:

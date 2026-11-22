@@ -97,7 +97,7 @@ def build_executor(args, telemetry):
         return CodexExecutor(
             working_directory=workspace, command=(args.command or "codex",), model=args.model,
             effort=args.effort, timeout=args.timeout, result_schema=schema,
-            max_prompt_bytes=MAX_PROMPT_BYTES, telemetry_sink=telemetry)
+            max_prompt_bytes=MAX_PROMPT_BYTES, telemetry_sink=telemetry, daybreak=args.daybreak)
     from examples.hermes.hermes_executor import HermesExecutor
     scratch = workspace.parent / "hermes-scratch"
     scratch.mkdir(exist_ok=True)
@@ -126,7 +126,11 @@ def parse_args(argv=None):
     parser.add_argument("--capacity", type=int, default=1)
     parser.add_argument("--heartbeat-seconds", type=float, default=5.0)
     parser.add_argument("--record", type=Path)
+    parser.add_argument("--daybreak", action="store_true",
+                        help="codex runner: ask for OpenAI's Daybreak handling on every run")
     args = parser.parse_args(argv)
+    if args.daybreak and args.runner != "codex":
+        parser.error("--daybreak applies only to the codex runner")
     if args.runner == "hermes" and not (args.model and args.provider):
         parser.error("the hermes runner needs --model and --provider")
     return args

@@ -53,6 +53,18 @@ routes some open models to third-party hosts.
 3. Check each login: `claude auth status`, `codex login status` (must say
    ChatGPT), and that Hermes works with your provider.
 
+### OpenAI's cyber safeguards and Daybreak
+
+OpenAI may refuse vulnerability-hunting requests to Codex as a possible
+cybersecurity risk. The task then fails as `codex_safety_refusal` without
+using any tokens, and the rest of the run carries on. If your account is
+approved for OpenAI's Daybreak program (Trusted Access for Cyber), set
+`"daybreak": true` on the Codex model in your models file. Each run then
+passes `-c daybreak=true`, which needs Codex CLI 0.163.0 or later; the worker
+checks the version before accepting work. Your Codex config file is not read,
+so a `daybreak` setting there has no effect on these runs. Daybreak does not
+lift every refusal, and which tier you have decides what it changes.
+
 ## Run a pilot first
 
 One area, every hunter, no mapping. It checks every runner end to end and shows

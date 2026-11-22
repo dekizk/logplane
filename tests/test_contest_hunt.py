@@ -10,7 +10,7 @@ from pathlib import Path
 
 from examples.contest_hunt.briefs import number_candidates
 from examples.contest_hunt.run import production_diff, find_test_module
-from examples.contest_hunt.worker import BriefingExecutor
+from examples.contest_hunt.worker import BriefingExecutor, parse_args as worker_args
 from logplane.executors import AssignmentContext, Completed, PermanentFailure
 
 REPO = Path(__file__).resolve().parents[1]
@@ -231,6 +231,16 @@ class ContestHuntTests(unittest.TestCase):
         self.assertNotIn("#[test]", (out / "workspace" / "contest" / "scope.diff").read_text())
         self.assertTrue((out / "records" / "glm-hunt.jsonl").exists())
         self.assertGreater(summary["workflow"]["tokens"], 0)
+
+
+
+class DaybreakOptionTests(unittest.TestCase):
+    def test_daybreak_is_a_codex_only_worker_flag(self):
+        base = ["--stage", "hunt", "--name", "w", "--workspace", ".", "--bus-url", "http://x"]
+        self.assertTrue(worker_args(["--runner", "codex", "--daybreak", *base]).daybreak)
+        self.assertFalse(worker_args(["--runner", "codex", *base]).daybreak)
+        with self.assertRaises(SystemExit):
+            worker_args(["--runner", "claude", "--daybreak", *base])
 
 
 if __name__ == "__main__":

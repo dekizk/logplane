@@ -145,6 +145,8 @@ class Workers:
         for key in ("model", "effort", "provider", "command", "timeout", "max_turns", "max_budget_usd"):
             if spec.get(key) is not None:
                 argv += ["--" + key.replace("_", "-"), str(spec[key])]
+        if spec.get("daybreak") is True:
+            argv.append("--daybreak")
         mark = self.harness.last_event_id()
         log = (self.harness.logs / f"{name}.log").open("a", encoding="utf-8")
         process = subprocess.Popen([sys.executable, *argv], cwd=self.out, env=self.environment,

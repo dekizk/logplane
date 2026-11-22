@@ -15,6 +15,9 @@ from logplane.executors import AssignmentContext, Completed, PermanentFailure, R
 FAKE_CODEX = r'''
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
+if args == ["--version"]:
+    print(os.environ.get("FAKE_VERSION", "codex-cli 0.170.0"))
+    sys.exit(0)
 if args[:2] == ["login", "status"]:
     status = os.environ.get("FAKE_LOGIN", "Logged in using ChatGPT")
     sys.stderr.write(status + "\n")
@@ -41,6 +44,10 @@ if mode == "write":
     emit({"type": "item.completed", "item": {"id": "i0", "type": "file_change", "changes": []}})
 if mode == "fail":
     emit({"type": "turn.failed", "error": {"message": "usage limit reached"}})
+    sys.exit(1)
+if mode == "refused":
+    emit({"type": "error", "message": "This content was flagged for possible cybersecurity risk."})
+    emit({"type": "turn.failed", "error": {"message": "This content was flagged for possible cybersecurity risk."}})
     sys.exit(1)
 emit({"type": "item.completed", "item": {"id": "i1", "type": "command_execution",
                                          "command": "rg foo", "status": "completed"}})
@@ -123,6 +130,25 @@ class CodexExecutorTests(unittest.TestCase):
         report = executor.last_report[1]
         self.assertEqual(1000, report["usage"]["input_tokens"])
         self.assertEqual({"agent_message": 1, "command_execution": 1}, report["items"])
+
+    def test_daybreak_is_passed_on_every_run_and_needs_a_recent_cli(self):
+        outcome, _ = self.run_one(daybreak=True)
+        self.assertIsInstance(outcome, Completed)
+        argv = json.loads(self.log.read_text())["argv"]
+        self.assertEqual("daybreak=true", argv[argv.index("daybreak=true")])
+        self.assertEqual("-c", argv[argv.index("daybreak=true") - 1])
+        self.run_one()
+        self.assertNotIn("daybreak=true", json.loads(self.log.read_text())["argv"])
+        for version in ("codex-cli 0.162.9", "no version here"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                self.executor(daybreak=True, extra_env={"FAKE_VERSION": version})
+
+    def test_a_cyber_safety_refusal_is_named(self):
+        outcome, executor = self.run_one("refused")
+        self.assertIsInstance(outcome, PermanentFailure)
+        self.assertEqual("codex_safety_refusal", outcome.code)
+        self.assertIn("cyber safeguards", outcome.reason)
+        self.assertTrue(executor.last_report[1]["safety_refusal"])
 
     def test_refuses_anything_but_a_chatgpt_login(self):
         for status in ("Not logged in", "API key configured - sk-…", "Logged in using access token"):
