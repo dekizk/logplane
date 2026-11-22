@@ -118,7 +118,10 @@ def usage_limit_wait(message: object, now: Optional[float] = None) -> Optional[f
         zone = ZoneInfo(found["zone"]) if found["zone"] else None
     except (KeyError, ValueError, OSError):
         zone = None
-    current = datetime.fromtimestamp(now, zone) if zone else datetime.fromtimestamp(now).astimezone()
+    # With a named zone these are aware datetimes in it; without one they are
+    # naive local times, which timestamp() below resolves by the host's rules
+    # for the reset's own date, not by today's offset.
+    current = datetime.fromtimestamp(now, zone)
     try:
         hour = int(found["hour"]) % 12 + (12 if found["ampm"].lower() == "pm" else 0)
         reset = current.replace(hour=hour, minute=int(found["minute"] or 0),

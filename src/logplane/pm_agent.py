@@ -12,7 +12,7 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -40,6 +40,11 @@ class OrderedProjectionCursor:
 
     state: PMState
     last_event_id: int = 0
+    # The bus's own clock, as far as this consumer has seen it, and tasks whose
+    # retry the bus refused as too early: each is held until that clock reaches
+    # the task's retry time. Process-local planning aids, never replayed state.
+    latest_event_ts: float = 0.0
+    retry_holds: dict[int, float] = field(default_factory=dict)
 
     def consume(self, events: Iterable[dict]) -> list[tuple[dict, bool]]:
         consumed: list[tuple[dict, bool]] = []
@@ -53,6 +58,9 @@ class OrderedProjectionCursor:
                 continue
             applied = apply_event(self.state, event)
             self.last_event_id = event_id
+            event_ts = event.get("ts")
+            if isinstance(event_ts, (int, float)) and not isinstance(event_ts, bool):
+                self.latest_event_ts = max(self.latest_event_ts, float(event_ts))
             consumed.append((event, applied))
         return consumed
 
@@ -220,8 +228,14 @@ def plan_next_emission(
     default_workflow_max_wall_clock_seconds: object = _UNSET_POLICY_DEFAULT,
     default_workflow_reserve_tokens_per_assignment: object = _UNSET_POLICY_DEFAULT,
     default_workflow_reserve_cost_usd_per_assignment: object = _UNSET_POLICY_DEFAULT,
+    *,
+    skip_assignment_task_ids: frozenset[int] = frozenset(),
 ) -> Optional[dict]:
-    """Return the next deterministic effect needed to reconcile derived state."""
+    """Return the next deterministic effect needed to reconcile derived state.
+
+    ``skip_assignment_task_ids`` names open tasks not to assign in this plan;
+    ``reconcile`` uses it to hold a retry the bus's clock says is too early.
+    """
     for task_id in sorted(state.tasks):
         task = state.tasks[task_id]
         if (
@@ -644,7 +658,9 @@ def plan_next_emission(
                 ),
             }
 
-    assignment_candidate = state.next_assignment_candidate(now, lease_seconds)
+    assignment_candidate = state.next_assignment_candidate(
+        now, lease_seconds, skip_assignment_task_ids
+    )
     if assignment_candidate is not None:
         task, worker = assignment_candidate
         attempt = task.last_assignment_attempt + 1
@@ -746,6 +762,17 @@ def plan_next_emission(
     return None
 
 
+def _held_retries(
+    state: PMState, holds: dict[int, float], bus_time: float
+) -> frozenset[int]:
+    """Tasks still held for a retry time the bus's clock has not reached."""
+    for task_id, until in list(holds.items()):
+        task = state.tasks.get(task_id)
+        if task is None or task.retry_not_before != until or bus_time >= until:
+            del holds[task_id]
+    return frozenset(holds)
+
+
 def reconcile(
     state: PMState,
     bus: BusClient,
@@ -765,8 +792,12 @@ def reconcile(
 ) -> list[dict]:
     """Publish effects until stable, consuming persisted order when available."""
     emitted: list[dict] = []
+    retry_holds = cursor.retry_holds if cursor is not None else {}
+    bus_time = cursor.latest_event_ts if cursor is not None else 0.0
     for _ in range(10_000):
         current_time = now if now is not None else clock()
+        if cursor is not None:
+            bus_time = max(bus_time, cursor.latest_event_ts)
         planned = plan_next_emission(
             state,
             current_time,
@@ -779,6 +810,7 @@ def reconcile(
             default_workflow_max_wall_clock_seconds,
             default_workflow_reserve_tokens_per_assignment,
             default_workflow_reserve_cost_usd_per_assignment,
+            skip_assignment_task_ids=_held_retries(state, retry_holds, bus_time),
         )
         if planned is None:
             return emitted
@@ -823,6 +855,26 @@ def reconcile(
                 for event, event_applied in consumed
             )
         emitted.append(sent)
+        sent_ts = sent.get("ts")
+        if isinstance(sent_ts, (int, float)) and not isinstance(sent_ts, bool):
+            bus_time = max(bus_time, float(sent_ts))
+            if planned["topic"] == "task.assigned":
+                task = state.tasks.get(planned["payload"]["task_id"])
+                if (
+                    task is not None
+                    and task.retry_not_before is not None
+                    and task.assignment_id != planned["payload"]["assignment_id"]
+                    and sent_ts < task.retry_not_before
+                ):
+                    # This clock said the retry delay had passed; the bus's
+                    # clock, which decides, said it had not. Planning the same
+                    # task again now would only repeat the refusal.
+                    retry_holds[task.task_id] = task.retry_not_before
+                    print(
+                        f"[pm] task {task.task_id} retry was early by the bus clock; "
+                        "holding it until the bus reaches its retry time",
+                        flush=True,
+                    )
         print(
             (
                 f"[pm] reconciled -> {sent['topic']}#{sent['id']} {sent['payload']}"

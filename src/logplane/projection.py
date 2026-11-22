@@ -402,11 +402,13 @@ class PMState:
         self,
         now: float,
         lease_seconds: float,
+        skip_task_ids: frozenset[int] = frozenset(),
     ) -> list[tuple[TaskRecord, WorkerRecord]]:
         candidates: list[tuple[TaskRecord, WorkerRecord]] = []
         for task in self.tasks.values():
             if (
                 task.status != "open"
+                or task.task_id in skip_task_ids
                 or task.assignment_id is not None
                 or task.ownership_owner != "agent-bus"
                 or self.workflow_is_paused(task.correlation_id)
@@ -436,9 +438,10 @@ class PMState:
         self,
         now: float,
         lease_seconds: float,
+        skip_task_ids: frozenset[int] = frozenset(),
     ) -> Optional[tuple[TaskRecord, WorkerRecord]]:
         """Choose a workflow fairly, then use priority within that workflow."""
-        candidates = self.ready_assignment_candidates(now, lease_seconds)
+        candidates = self.ready_assignment_candidates(now, lease_seconds, skip_task_ids)
         if not candidates:
             return None
         by_workflow: dict[

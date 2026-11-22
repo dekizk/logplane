@@ -1,6 +1,8 @@
 """A retryable failure can ask for a wait before the next attempt."""
 
 import json
+import os
+import time
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -16,9 +18,9 @@ from logplane.event_validation import EventValidationError, validate_event
 from logplane.executors import PermanentFailure, RetryableFailure, outcome_from_dict
 from logplane.limits import MAX_RETRY_AFTER_SECONDS
 from logplane.operations import explain_task, task_view
-from logplane.pm_agent import plan_next_emission
-from logplane.projection import replay_events
-from tests.test_pm_agent import assigned, attempt_failed, created, registered
+from logplane.pm_agent import OrderedProjectionCursor, plan_next_emission, reconcile
+from logplane.projection import PMState, replay_events
+from tests.test_pm_agent import FakeBus, assigned, attempt_failed, created, event, registered
 from tests.test_runtime import RuntimeOutcomeTests
 from tests.test_v09_integration_kit import assignment
 
@@ -145,6 +147,79 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotEqual("retry_delay_pending", after["code"])
 
 
+class ClockBus(FakeBus):
+    """A bus that stamps events with its own clock (``ts``), not the PM's."""
+
+    def __init__(self, starting_id, ts):
+        super().__init__(starting_id, ts=ts)
+        self.unread = []
+
+    def heartbeat(self, ts):
+        self.unread.append(event(self.next_id, "agent.heartbeat", "bob",
+                                 {"name": "bob", "instance_id": "bob-1"}, ts=ts))
+        self.next_id += 1
+
+    def query_all(self, after_id=0, topics=None):
+        log = sorted(self.unread + self.events, key=lambda item: item["id"])
+        return [item for item in log if item["id"] > after_id]
+
+
+class FastCoordinatorClockTests(unittest.TestCase):
+    """The PM's clock runs ahead of the bus's; the retry is due at bus time 700."""
+
+    def events(self):
+        return [registered(), registered(2, name="bob", instance="bob-1"),
+                created(3, max_retries=2), assigned(4, 1), delayed_failure(5, 1, 600),
+                created(6, task_id=2)]
+
+    def task_one_assignments(self, bus):
+        return [item["payload"]["attempt"] for item in bus.events
+                if item["topic"] == "task.assigned" and item["payload"]["task_id"] == 1]
+
+    def test_one_early_refusal_then_the_task_is_held_until_the_bus_clock_catches_up(self):
+        cursor = OrderedProjectionCursor(PMState())
+        cursor.consume(self.events())
+        state, bus = cursor.state, ClockBus(starting_id=7, ts=699.9)
+        options = dict(lease_seconds=100_000, cursor=cursor)
+
+        reconcile(state, bus, now=700.5, **options)
+        self.assertEqual([2], self.task_one_assignments(bus))  # refused once, not in a loop
+        self.assertEqual(("open", "assigned"), (state.tasks[1].status, state.tasks[2].status))
+        self.assertEqual({1: 700.0}, cursor.retry_holds)
+
+        reconcile(state, bus, now=700.6, **options)
+        bus.heartbeat(699.95)
+        cursor.catch_up(bus)
+        reconcile(state, bus, now=700.7, **options)
+        self.assertEqual([2], self.task_one_assignments(bus))
+
+        bus.ts = 700.0
+        bus.heartbeat(700.0)
+        cursor.catch_up(bus)
+        reconcile(state, bus, now=700.8, **options)
+        self.assertEqual([2, 3], self.task_one_assignments(bus))
+        self.assertEqual(("assigned", "task:1:attempt:3"),
+                         (state.tasks[1].status, state.tasks[1].assignment_id))
+        self.assertEqual({}, cursor.retry_holds)
+
+    def test_without_a_cursor_reconcile_still_stops_after_one_refusal(self):
+        state = replay_events(self.events())
+        bus = FakeBus(starting_id=7, ts=699.9)
+        emitted = reconcile(state, bus, now=700.5, lease_seconds=100_000)
+        self.assertEqual([2], self.task_one_assignments(bus))
+        self.assertEqual("assigned", state.tasks[2].status)
+        self.assertLess(len(emitted), 5)
+
+    def test_matching_clocks_assign_on_time_with_no_refusal(self):
+        cursor = OrderedProjectionCursor(PMState())
+        cursor.consume(self.events())
+        bus = ClockBus(starting_id=7, ts=700.0)
+        reconcile(cursor.state, bus, now=700.0, lease_seconds=100_000, cursor=cursor)
+        self.assertEqual([2], self.task_one_assignments(bus))
+        self.assertEqual("assigned", cursor.state.tasks[1].status)
+        self.assertEqual({}, cursor.retry_holds)
+
+
 class OutcomeTests(unittest.TestCase):
     def test_retryable_failure_validates_its_delay(self):
         self.assertIsNone(RetryableFailure("c", "r").retry_after_seconds)
@@ -225,6 +300,24 @@ class UsageLimitTests(unittest.TestCase):
             with self.subTest(day=day):
                 now = datetime(*day, 0, 30, tzinfo=new_york).timestamp()
                 self.assertEqual(hours * 3600 + 60, usage_limit_wait(message, now))
+
+    def test_a_message_without_a_zone_uses_the_hosts_rules_for_the_reset_date(self):
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            new_york = ZoneInfo("America/New_York")
+            message = "You've hit your limit · resets 3:30am"
+            for day, hours in (((2026, 3, 8), 2), ((2026, 11, 1), 4), ((2026, 6, 1), 3)):
+                with self.subTest(day=day):
+                    now = datetime(*day, 0, 30, tzinfo=new_york).timestamp()
+                    self.assertEqual(hours * 3600 + 60, usage_limit_wait(message, now))
+        finally:
+            if previous is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
 
     def test_claude_code_reports_a_limit_as_a_retryable_failure_with_a_wait(self):
         def stream(result):
