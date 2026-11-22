@@ -127,8 +127,12 @@ def _brief(text: object) -> str:
     return value[:MAX_REASON_CHARS] + ("…" if len(value) > MAX_REASON_CHARS else "")
 
 
-def parse_events(returncode: int, stdout: bytes) -> tuple[Outcome, dict]:
-    """Map `codex exec --json` events to an outcome, plus a separate report."""
+def parse_events(returncode: int, stdout: bytes, stderr: str = "") -> tuple[Outcome, dict]:
+    """Map `codex exec --json` events to an outcome, plus a separate report.
+
+    ``stderr`` is Codex's own error output; it explains a failure that happens
+    before any event is printed, such as a rejected setting.
+    """
     usage = {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
              "output_tokens": 0, "reasoning_output_tokens": 0}
     turns, final, errors, item_counts = 0, None, [], {}
@@ -164,7 +168,9 @@ def parse_events(returncode: int, stdout: bytes) -> tuple[Outcome, dict]:
                                 "Codex took actions it should not have: " + ", ".join(unexpected) +
                                 "; outcome discarded"), report
     if errors or returncode != 0:
-        detail = _brief(errors[-1] if errors else f"exit {returncode}")
+        detail = _brief(errors[-1] if errors
+                        else f"exit {returncode}: {stderr.strip()}" if stderr.strip()
+                        else f"exit {returncode}")
         if any(_SAFETY_REFUSAL in str(error) for error in errors):
             report["safety_refusal"] = True
             return PermanentFailure(
@@ -296,11 +302,14 @@ class CodexExecutor:
             prompt_path.write_text(prompt, encoding="utf-8")
             schema_path = Path(directory) / "schema.json"
             schema_path.write_text(json.dumps(self.schema), encoding="utf-8")
+            # Codex's error output goes to a file, so a chatty stderr can never
+            # fill a pipe and stall the run; only its tail is reported.
+            stderr_path = Path(directory) / "stderr.txt"
             try:
-                with prompt_path.open("rb") as stdin:
+                with prompt_path.open("rb") as stdin, stderr_path.open("wb") as stderr:
                     process = subprocess.Popen(
                         self.argv(schema_path), cwd=self.directory, env=self.environment,
-                        stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        stdin=stdin, stdout=subprocess.PIPE, stderr=stderr,
                         start_new_session=True)
             except OSError:
                 return PermanentFailure("codex_start_failed", "Could not start the Codex command"), {}
@@ -323,7 +332,9 @@ class CodexExecutor:
                                 return PermanentFailure("codex_output_too_large",
                                                         "Codex exceeded the output limit"), {}
                             output.extend(chunk)
-                return parse_events(process.returncode, bytes(output))
+                process.wait()
+                stderr_tail = stderr_path.read_bytes()[-2000:].decode("utf-8", "replace")
+                return parse_events(process.returncode, bytes(output), stderr_tail)
             except OSError:
                 return RetryableFailure("codex_io_error", "Codex output could not be read"), {}
             finally:

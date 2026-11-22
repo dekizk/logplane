@@ -34,6 +34,9 @@ for name, value in (("FAKE_PID", str(os.getpid())),):
     if os.environ.get(name):
         pathlib.Path(os.environ[name]).write_text(value)
 mode = os.environ.get("FAKE_CODEX_MODE", "ok")
+if mode == "rejected_setting":
+    sys.stderr.write("Error: unknown configuration key `daybreak`\n")
+    sys.exit(1)
 def emit(event):
     print(json.dumps(event), flush=True)
 emit({"type": "thread.started", "thread_id": "t1"})
@@ -142,6 +145,11 @@ class CodexExecutorTests(unittest.TestCase):
         for version in ("codex-cli 0.162.9", "no version here"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 self.executor(daybreak=True, extra_env={"FAKE_VERSION": version})
+
+    def test_codex_error_output_explains_an_early_exit(self):
+        outcome, _ = self.run_one("rejected_setting", daybreak=True)
+        self.assertEqual("codex_failed", outcome.code)
+        self.assertIn("unknown configuration key `daybreak`", outcome.reason)
 
     def test_a_cyber_safety_refusal_is_named(self):
         outcome, executor = self.run_one("refused")
