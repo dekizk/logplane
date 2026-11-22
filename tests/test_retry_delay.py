@@ -72,6 +72,28 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(("task.assigned", 2),
                          (planned["topic"], planned["payload"]["attempt"]))
 
+    def test_replay_refuses_an_assignment_stamped_before_the_delay_has_passed(self):
+        early = assigned(5, 2)
+        early["ts"] = 699.9
+        state = replay_events(history(600) + [early])
+        task = state.tasks[1]
+        # Recorded, but not ownership: the task still waits, and the attempt
+        # number is consumed so the next plan gets a fresh assignment id.
+        self.assertEqual(("open", 700.0, None, 2),
+                         (task.status, task.retry_not_before, task.assignment_id,
+                          task.last_assignment_attempt))
+        self.assertIsNone(plan(state, 699.95))
+        planned = plan(state, 700.0)
+        self.assertEqual(("task.assigned", 3, "task:1:attempt:3"),
+                         (planned["topic"], planned["payload"]["attempt"],
+                          planned["payload"]["assignment_id"]))
+        on_time = assigned(6, 3)
+        on_time["ts"] = 700.0
+        state = replay_events(history(600) + [early, on_time])
+        self.assertEqual(("assigned", "task:1:attempt:3", None),
+                         (state.tasks[1].status, state.tasks[1].assignment_id,
+                          state.tasks[1].retry_not_before))
+
     def test_without_a_delay_the_retry_is_immediate_as_before(self):
         state = replay_events(history(None))
         self.assertIsNone(state.tasks[1].retry_not_before)
@@ -196,6 +218,14 @@ class UsageLimitTests(unittest.TestCase):
         wait = usage_limit_wait("You've hit your limit · resets 2:10pm (Australia/Brisbane)", NOW)
         self.assertEqual(24 * 3600 + 60, wait)
 
+    def test_the_wait_is_elapsed_time_across_a_daylight_saving_change(self):
+        new_york = ZoneInfo("America/New_York")
+        message = "You've hit your limit · resets 3:30am (America/New_York)"
+        for day, hours in (((2026, 3, 8), 2), ((2026, 11, 1), 4), ((2026, 6, 1), 3)):
+            with self.subTest(day=day):
+                now = datetime(*day, 0, 30, tzinfo=new_york).timestamp()
+                self.assertEqual(hours * 3600 + 60, usage_limit_wait(message, now))
+
     def test_claude_code_reports_a_limit_as_a_retryable_failure_with_a_wait(self):
         def stream(result):
             init = {"type": "system", "subtype": "init", "apiKeySource": "none", "tools": []}
@@ -233,6 +263,19 @@ class UsageLimitTests(unittest.TestCase):
         self.assertEqual("codex_safety_refusal", refused.code)
         plain, _ = parse_events(1, events("model overloaded"))
         self.assertEqual("codex_failed", plain.code)
+
+    def test_codex_classifies_from_stderr_when_no_event_was_printed(self):
+        # Parser checks with made-up output, not messages seen from the provider.
+        limited, _ = parse_events(1, b"", "Error: You've hit your usage limit. Try again in 45 minutes.")
+        self.assertIsInstance(limited, RetryableFailure)
+        self.assertEqual(("codex_usage_limit", 45 * 60 + 60.0),
+                         (limited.code, limited.retry_after_seconds))
+        refused, _ = parse_events(
+            1, b"", "This content was flagged for possible cybersecurity risk; usage limit unaffected.")
+        self.assertIsInstance(refused, PermanentFailure)
+        self.assertEqual("codex_safety_refusal", refused.code)
+        other, _ = parse_events(1, b"", "Error: unknown configuration key")
+        self.assertEqual("codex_failed", other.code)
 
 
 if __name__ == "__main__":

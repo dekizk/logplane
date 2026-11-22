@@ -132,7 +132,9 @@ def usage_limit_wait(message: object, now: Optional[float] = None) -> Optional[f
             reset += timedelta(days=1)
     except ValueError:
         return USAGE_LIMIT_DEFAULT_WAIT
-    wait = (reset - current).total_seconds() + USAGE_LIMIT_MARGIN
+    # Elapsed time between the two instants. Subtracting the local datetimes
+    # would ignore a daylight-saving change between now and the reset.
+    wait = reset.timestamp() - now + USAGE_LIMIT_MARGIN
     return min(max(wait, USAGE_LIMIT_MARGIN), MAX_RETRY_AFTER_SECONDS)
 
 

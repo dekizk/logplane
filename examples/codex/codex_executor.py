@@ -197,12 +197,15 @@ def parse_events(returncode: int, stdout: bytes, stderr: str = "") -> tuple[Outc
         detail = _brief(errors[-1] if errors
                         else f"exit {returncode}: {stderr.strip()}" if stderr.strip()
                         else f"exit {returncode}")
-        if any(_SAFETY_REFUSAL in str(error) for error in errors):
+        # Classify from everything Codex said, the same text the reason shows:
+        # a limit or refusal can arrive on stderr with no JSON event at all.
+        said = " ".join([*(str(error) for error in errors), stderr])
+        if _SAFETY_REFUSAL in said:
             report["safety_refusal"] = True
             return PermanentFailure(
                 "codex_safety_refusal",
                 f"OpenAI's cyber safeguards refused this request: {detail}"), report
-        wait = codex_usage_limit_wait(" ".join(str(error) for error in errors))
+        wait = codex_usage_limit_wait(said)
         if wait is not None:
             report["usage_limit_wait_seconds"] = round(wait)
             return RetryableFailure(

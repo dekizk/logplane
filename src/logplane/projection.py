@@ -1356,9 +1356,17 @@ def _apply_task_assigned(
         != current_agent_policy_event_id
         or (worker is not None and state.agent_limit_reached(worker))
     )
+    # A retry delay is part of the ordered history, so an assignment stamped
+    # before it has passed is a stale plan (a coordinator with a fast clock, or
+    # one that predates the delay), not ownership.
+    fenced_by_retry_delay = (
+        task.retry_not_before is not None
+        and float(timestamp) < task.retry_not_before
+    )
     task.last_assignment_attempt = attempt
     if (
         fenced_by_control
+        or fenced_by_retry_delay
         or fenced_by_policy
         or fenced_by_fairness
         or fenced_by_agent_policy
