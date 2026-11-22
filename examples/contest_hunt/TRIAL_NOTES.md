@@ -68,9 +68,10 @@ expiries, crashes or stale results in any run.
 What this asks of Logplane:
 
 - **A usage limit should be retried after it resets**, not ended as a
-  permanent failure. The message names the reset time, so the adapter could
-  report a retryable failure with a matching delay. This is the retry backoff
-  item in the reliability list.
+  permanent failure. Done since: the Claude Code and Codex workers report a
+  retryable failure that waits for the reset time
+  (`RetryableFailure(retry_after_seconds=...)`). Not yet seen against a live
+  limit.
 - **One retry for a malformed model answer** may be worth having; it would not
   have saved glm on A05, which failed the same way twice.
 - **Rerunning one stage** (triage, or a list of hunts) without a full run

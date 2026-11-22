@@ -640,6 +640,11 @@ class WorkerRuntime:
                     "failure_code": outcome.code,
                     "reason": outcome.reason,
                     "retryable": retryable,
+                    **(
+                        {"retry_after_seconds": outcome.retry_after_seconds}
+                        if retryable and outcome.retry_after_seconds is not None
+                        else {}
+                    ),
                 },
                 caused_by=assignment.assignment_event_id,
                 idempotency_key=f"attempt-failed:{assignment_id}",

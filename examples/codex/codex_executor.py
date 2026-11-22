@@ -34,7 +34,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from examples.claude_code.claude_code_executor import _stop_process_group, outcome_from_fields
+from examples.claude_code.claude_code_executor import (
+    _stop_process_group, outcome_from_fields, usage_limit_wait,
+)
+from logplane.limits import MAX_RETRY_AFTER_SECONDS
 from logplane.executors import AssignmentContext, Outcome, PermanentFailure, RetryableFailure
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")  # as `codex debug models` lists
@@ -107,6 +110,29 @@ def check_daybreak_version(command: tuple[str, ...], environment: dict) -> str:
     return found.group(0)
 
 
+_TRY_AGAIN_IN = re.compile(r"try again in\b(?P<span>[^.]*)", re.I)
+_SPAN_PART = re.compile(r"(\d+)\s*(day|hour|minute|second)", re.I)
+_SPAN_SECONDS = {"day": 86400, "hour": 3600, "minute": 60, "second": 1}
+
+
+def codex_usage_limit_wait(message: object, now: Optional[float] = None) -> Optional[float]:
+    """Seconds to wait when Codex reports a usage limit; ``None`` if it does not.
+
+    Reads a span such as "try again in 3 hours 12 minutes", or a reset time;
+    otherwise the default wait. The message wording is from Codex's source and
+    reports, not yet seen in a live limit by this adapter.
+    """
+    wait = usage_limit_wait(message, now)
+    if wait is None:
+        return None
+    span = _TRY_AGAIN_IN.search(str(message))
+    parts = _SPAN_PART.findall(span["span"]) if span else []
+    if parts:
+        total = sum(int(count) * _SPAN_SECONDS[unit.lower()] for count, unit in parts)
+        return min(max(total + 60.0, 60.0), MAX_RETRY_AFTER_SECONDS)
+    return wait
+
+
 def check_login_status(command: tuple[str, ...], environment: dict) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix="logplane-codex-auth-") as empty:
@@ -176,6 +202,12 @@ def parse_events(returncode: int, stdout: bytes, stderr: str = "") -> tuple[Outc
             return PermanentFailure(
                 "codex_safety_refusal",
                 f"OpenAI's cyber safeguards refused this request: {detail}"), report
+        wait = codex_usage_limit_wait(" ".join(str(error) for error in errors))
+        if wait is not None:
+            report["usage_limit_wait_seconds"] = round(wait)
+            return RetryableFailure(
+                "codex_usage_limit", f"Codex hit a usage limit: {detail}",
+                retry_after_seconds=wait), report
         return PermanentFailure("codex_failed", f"Codex failed: {detail}"), report
     if not isinstance(final, str):
         return PermanentFailure("codex_no_outcome", "Codex finished without a final message"), report

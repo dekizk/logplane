@@ -20,6 +20,7 @@ from logplane.limits import (
     MAX_EXTERNAL_ID_LENGTH,
     MAX_INLINE_CONTEXT_BYTES,
     MAX_INLINE_RESULT_BYTES,
+    MAX_RETRY_AFTER_SECONDS,
     MAX_TASK_DEPENDENCIES,
 )
 from logplane.scheduling import DEFAULT_TASK_PRIORITY, validate_task_priority
@@ -941,6 +942,17 @@ def _attempt_failed(event: _Event) -> None:
         _require_string(event.payload, field)
     if not isinstance(event.payload.get("retryable"), bool):
         raise EventValidationError("payload.retryable must be a boolean")
+    if "retry_after_seconds" in event.payload:
+        delay = event.payload["retry_after_seconds"]
+        if not _is_positive_number(delay) or delay > MAX_RETRY_AFTER_SECONDS:
+            raise EventValidationError(
+                "payload.retry_after_seconds must be a positive number of at most "
+                f"{MAX_RETRY_AFTER_SECONDS} seconds"
+            )
+        if not event.payload["retryable"]:
+            raise EventValidationError(
+                "payload.retry_after_seconds applies only to a retryable failure"
+            )
 
 
 def _assignment_expired(event: _Event) -> None:

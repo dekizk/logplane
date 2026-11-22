@@ -46,7 +46,7 @@ if mode == "sleep":
 if mode == "write":
     emit({"type": "item.completed", "item": {"id": "i0", "type": "file_change", "changes": []}})
 if mode == "fail":
-    emit({"type": "turn.failed", "error": {"message": "usage limit reached"}})
+    emit({"type": "turn.failed", "error": {"message": "model overloaded"}})
     sys.exit(1)
 if mode == "refused":
     emit({"type": "error", "message": "This content was flagged for possible cybersecurity risk."})
@@ -180,7 +180,7 @@ class CodexExecutorTests(unittest.TestCase):
     def test_failures(self):
         outcome, _ = self.run_one("fail")
         self.assertEqual("codex_failed", outcome.code)
-        self.assertIn("usage limit", outcome.reason)
+        self.assertIn("model overloaded", outcome.reason)
         outcome, _ = self.run_one("garbled")
         self.assertEqual("codex_invalid_outcome", outcome.code)
         self.assertEqual("codex_invalid_output", parse_events(0, b"not json\n")[0].code)

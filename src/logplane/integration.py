@@ -23,6 +23,7 @@ from logplane.executor_protocol import (
     parse_outcome_message,
     validate_protocol_version,
 )
+from logplane.limits import MAX_RETRY_AFTER_SECONDS
 from logplane.executors import (
     DEFAULT_MAX_PROTOCOL_BYTES,
     AssignmentContext,
@@ -38,6 +39,17 @@ from logplane.executors import (
 INTEGRATION_CONFIG_VERSION = 1
 DEFAULT_ADAPTER_TIMEOUT_SECONDS = 300.0
 RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429})
+
+
+def _retry_after(value: Optional[str]) -> Optional[float]:
+    """A ``Retry-After`` header given in seconds; the date form is ignored."""
+    try:
+        seconds = float(value) if value is not None else None
+    except ValueError:
+        return None
+    if seconds is None or not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
 class PythonAgentAdapter(InProcessExecutor):
@@ -324,6 +336,9 @@ class HttpAgentAdapter:
                     return RetryableFailure(
                         "http_agent_unavailable",
                         f"HTTP agent returned status {status_code}",
+                        retry_after_seconds=_retry_after(
+                            response.headers.get("Retry-After")
+                        ),
                     )
                 if status_code >= 400:
                     return PermanentFailure(

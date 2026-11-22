@@ -92,7 +92,10 @@ folder); `--stage-timeout-hours`.
 
 A full run is roughly areas × hunters tasks (ten seed areas × three hunters is
 30), each taking minutes to half an hour. Subscriptions have usage limits; keep
-`capacity` low per model and start with the pilot.
+`capacity` low per model and start with the pilot. When a Claude Code or Codex
+hunt hits its plan's usage limit, the task waits for the reset time the tool
+reports and is then retried once, instead of failing; a wait longer than
+`--stage-timeout-hours` still ends the stage.
 
 ## What you get
 

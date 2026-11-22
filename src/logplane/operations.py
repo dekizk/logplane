@@ -13,6 +13,7 @@ from logplane.projection import (
     CoordinationProjection,
     TaskRecord,
     replay_events,
+    retry_budget_exhausted,
 )
 
 
@@ -391,6 +392,24 @@ def explain_task(
             seconds_remaining=round(task.not_before - now, 3),
         )
 
+    if (
+        task.retry_not_before is not None
+        and now < task.retry_not_before
+        and not retry_budget_exhausted(task)
+    ):
+        evidence.append(task.last_failure_event_id)
+        remaining = round(task.retry_not_before - now, 3)
+        return _explanation(
+            "retry_delay_pending",
+            f"Waiting {_duration(remaining)} before the next attempt: the last attempt "
+            f"failed with {task.last_failure_code} and asked for a delay.",
+            evidence,
+            failure_code=task.last_failure_code,
+            failure_reason=task.last_failure_reason,
+            retry_not_before=task.retry_not_before,
+            seconds_remaining=remaining,
+        )
+
     workflow_policy = state.workflow_control(task.correlation_id)
     if (
         workflow_policy is not None
@@ -608,6 +627,7 @@ def task_view(
         "required_capabilities": sorted(task.required_capabilities),
         "priority": task.priority,
         "not_before": task.not_before,
+        "retry_not_before": task.retry_not_before,
         "workflow_policy": _workflow_policy_view(workflow_control),
         "assignment_policy_event_id": task.assignment_policy_event_id,
         "assignment_agent_policy_event_id": task.assignment_agent_policy_event_id,
@@ -992,6 +1012,16 @@ def _explanation(
         "event_ids": sorted({value for value in event_ids if isinstance(value, int)}),
         "details": details,
     }
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 90:
+        return f"{seconds} seconds"
+    minutes = round(seconds / 60)
+    if minutes < 90:
+        return f"about {minutes} minutes"
+    return f"about {round(seconds / 3600, 1):g} hours"
 
 
 def _event_id(event: dict) -> int:

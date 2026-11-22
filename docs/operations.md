@@ -269,6 +269,16 @@ A permanent attempt failure does not spin: the PM immediately reconciles it
 to terminal `task.failed`. Blocking for a human decision does not consume the
 retry budget.
 
+A retry normally starts as soon as a capable worker is free. A worker can
+instead ask for a wait, by reporting `retry_after_seconds` with a retryable
+failure: the task then stays `open` and is not reassigned until that long
+after the failure event. This is for failures with a known recovery time,
+such as a provider's usage limit or an HTTP `Retry-After`. `logplane task`
+and `explain` show the wait as `retry_delay_pending` with the time remaining.
+The wait is at most seven days, the retry still consumes one retry, and a
+task whose retry budget is already spent fails at once instead of waiting.
+Deadlines, cancellation and pauses apply to a waiting task as usual.
+
 To revive a failed task, record a retry against its latest `task.failed` event
 (the [raw event](events.md#publishing-raw-events) is a `task.retry_requested`
 caused by that failure):

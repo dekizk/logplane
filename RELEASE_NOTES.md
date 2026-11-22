@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A retryable failure can ask for a wait.** `RetryableFailure` gains an
+  optional `retry_after_seconds`, carried as an optional field on
+  `task.attempt_failed`; the coordinator does not reassign the task until that
+  long after the failure, and `logplane task` and `explain` show the wait.
+  Failures without it retry immediately, as before, and existing histories
+  replay unchanged. The HTTP adapter honours a `Retry-After` header given in
+  seconds. The Claude Code and Codex workers now report a plan usage limit as
+  a retryable failure that waits for the reset time, instead of failing the
+  task permanently; the Claude wording was seen in a live run, the Codex
+  wording has not been.
 - **Tool-call approvals: ask before one tool call without restarting the
   agent.** A running attempt can publish `approval.requested` and keep its
   assignment while it waits; `logplane approvals`, `approve` and `deny` answer

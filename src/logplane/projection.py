@@ -15,6 +15,7 @@ from logplane.scheduling import (
     task_schedule_key,
     validate_task_priority,
 )
+from logplane.limits import MAX_RETRY_AFTER_SECONDS
 from logplane.topics import COORDINATION_TOPICS
 
 ACTIVE_TASK_STATUSES = {"assigned", "started"}
@@ -80,6 +81,9 @@ class TaskRecord:
     last_failure_code: Optional[str] = None
     last_failure_reason: Optional[str] = None
     permanent_failure_pending: bool = False
+    # Set by a retryable failure that asked for a wait (a provider's usage
+    # limit, a Retry-After): the task is not reassigned before this time.
+    retry_not_before: Optional[float] = None
     failed_event_id: Optional[int] = None
     terminal_failure_code: Optional[str] = None
     terminal_failure_reason: Optional[str] = None
@@ -410,6 +414,7 @@ class PMState:
                 or self.workflow_budget_block(task.correlation_id, now) is not None
                 or (task.deadline_at is not None and now >= task.deadline_at)
                 or (task.not_before is not None and now < task.not_before)
+                or (task.retry_not_before is not None and now < task.retry_not_before)
                 or task.permanent_failure_pending
                 or (
                     task.last_failure_event_id is not None
@@ -1367,6 +1372,7 @@ def _apply_task_assigned(
         task.status_event_id = event_id
         return True
     task.status = "assigned"
+    task.retry_not_before = None
     task.status_event_id = event_id
     task.attempt = attempt
     task.assignee = assignee
@@ -1503,8 +1509,14 @@ def _apply_task_attempt_failed(
     task.last_failure_code = failure_code
     task.last_failure_reason = reason
     task.permanent_failure_pending = not retryable
+    task.retry_not_before = None
     if retryable:
         task.retryable_failures += 1
+        # A malformed delay is ignored rather than rejecting the failure:
+        # the attempt has ended either way.
+        delay = _positive_number(payload.get("retry_after_seconds"))
+        if delay is not None and delay <= MAX_RETRY_AFTER_SECONDS:
+            task.retry_not_before = float(timestamp) + delay
     task.status = "open"
     task.status_event_id = event_id
     task.open_event_id = event_id
@@ -1663,6 +1675,7 @@ def _apply_task_retry_requested(
     # a permanent failure it deliberately does not restore the unused
     # automatic budget that the permanent classification bypassed.
     task.max_retries = task.retryable_failures + additional_retries - 1
+    task.retry_not_before = None
     task.status = "open"
     task.status_event_id = event_id
     task.open_event_id = event_id
