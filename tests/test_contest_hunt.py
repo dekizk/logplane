@@ -181,6 +181,33 @@ class ContestHuntTests(unittest.TestCase):
         self.assertIsInstance(bad, PermanentFailure)
         self.assertEqual("contest_bad_result", bad.code)
 
+    def test_briefing_works_through_a_symlinked_workspace_path(self):
+        # On macOS the temporary folder is /var/..., a link to /private/var/...;
+        # a brief inside the workspace must not look like it is outside.
+        real = self.root / "real-ws"
+        (real / "contest").mkdir(parents=True)
+        (real / "contest" / "brief.md").write_text("STAGE: hunt\nDo it")
+        (self.root / "linked-ws").symlink_to(real, target_is_directory=True)
+
+        class Delegate:
+            last_report = None
+
+            def execute(self, assignment):
+                return Completed("ok", {"candidates": []})
+
+        executor = BriefingExecutor(Delegate(), workspace=self.root / "linked-ws",
+                                    stage="hunt", inline=False)
+        outcome = executor.execute(AssignmentContext(
+            correlation_id="c", task_id=1, assignment_id="task:1:attempt:1", assignment_event_id=2,
+            attempt=1, goal="Hunt A01", assignee="w", worker_instance_id="i",
+            context={"brief": "contest/brief.md"}))
+        self.assertIsInstance(outcome, Completed)
+        escape = executor.execute(AssignmentContext(
+            correlation_id="c", task_id=1, assignment_id="task:1:attempt:2", assignment_event_id=2,
+            attempt=2, goal="Hunt A01", assignee="w", worker_instance_id="i",
+            context={"brief": "../outside.md"}))
+        self.assertEqual("contest_brief_unreadable", escape.code)
+
     def test_numbering_keeps_provenance(self):
         hunts = [{"area": "A01", "model": "x", "result": {"candidates": [{"title": "a"}, {"title": "b"}]}},
                  {"area": "A02", "model": "y", "result": {"candidates": [{"title": "c"}]}}]

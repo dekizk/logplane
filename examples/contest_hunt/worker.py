@@ -41,7 +41,11 @@ class BriefingExecutor:
     """
 
     def __init__(self, delegate, *, workspace: Path, stage: str, inline: bool):
-        self.delegate, self.workspace, self.stage, self.inline = delegate, workspace, stage, inline
+        # Resolved, so the containment check below compares like with like even
+        # when the workspace path runs through a symlink (on macOS, /var is
+        # /private/var).
+        self.delegate, self.stage, self.inline = delegate, stage, inline
+        self.workspace = Path(workspace).resolve()
         self.last_report = None
 
     def _read(self, relative: str, limit: int) -> str:
