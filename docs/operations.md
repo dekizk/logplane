@@ -264,10 +264,39 @@ later process configuration change cannot alter replayed task behavior.
 Historical tasks that predate this field remain unlimited rather than being
 silently assigned a new policy.
 
-A lease expiry and a retryable `task.attempt_failed` each consume one retry.
-A permanent attempt failure does not spin: the PM immediately reconciles it
-to terminal `task.failed`. Blocking for a human decision does not consume the
-retry budget.
+A retryable `task.attempt_failed` consumes one retry. A permanent attempt
+failure does not spin: the PM immediately reconciles it to terminal
+`task.failed`. Blocking for a human decision does not consume the retry
+budget.
+
+Losing a worker is not the task's failure, so a lease expiry has its own
+allowance. Every new `task.created` records
+`payload.lease_policy.max_expiries`, materialized from
+`LOGPLANE_MAX_LEASE_EXPIRIES` (default `3`) when omitted: the task is
+reassigned after each lost worker until it has lost more than that many, and
+then ends `task.failed` with `lease_expiry_limit_exhausted`. A task that kills
+its worker every time therefore still stops. `logplane task` shows the count
+as "lost workers 1 of 3 allowed". Tasks created before this policy existed
+keep the old rule, where a lease expiry consumes a retry. `logplane retry`
+reopens a task that ran out of either allowance, and its
+`--additional-retries N` then allows exactly N further assignments in total,
+whether each ends in a failure or a lost worker.
+
+The coordinator also avoids expiring leases it cannot judge. Old heartbeats
+mean it was not watching, not that workers died, in three cases: when it
+starts, when its event stream reconnects after any break, and when it has not
+looked at the log for longer than a lease (a suspended laptop). It then waits
+one lease period for workers to be heard from before expiring any lease for
+silence alone; a worker whose process was replaced is still expired at once.
+A reconnect does not extend the grace an earlier reconnect began, or start one
+within a lease period of that one ending, so a stream that drops every few
+seconds still leaves windows in which a silent worker is expired. That is not
+a guarantee: the coordinator only checks leases when it gets to look at the
+log, so if every look comes after a break longer than a lease, each one starts
+a new grace and a silent worker stays assigned until the connection holds for
+a lease period. A suspension shorter than a lease with no reconnect
+gets no grace, so a worker whose last heartbeat was already a few seconds old
+can still be expired after one.
 
 A retry normally starts as soon as a capable worker is free. A worker can
 instead ask for a wait, by reporting `retry_after_seconds` with a retryable

@@ -56,6 +56,17 @@ class TaskRecord:
     last_assignment_attempt: int = 0
     max_retries: Optional[int] = None
     retryable_failures: int = 0
+    # Losing a worker (a lease expiry) is charged to its own allowance, not to
+    # the retry budget, for tasks created with a lease policy. None keeps the
+    # behavior of older tasks: an expiry consumes a retry.
+    max_lease_expiries: Optional[int] = None
+    lease_expiries: int = 0
+    # A human retry grants a number of further assignments in total, whatever
+    # ends each one. While a grant is in force it replaces both allowances:
+    # the task is exhausted once failures and lost workers since the grant
+    # reach its size.
+    retry_grant: Optional[int] = None
+    retry_grant_base: int = 0
     assignee: Optional[str] = None
     worker_instance_id: Optional[str] = None
     assignment_id: Optional[str] = None
@@ -420,8 +431,7 @@ class PMState:
                 or task.permanent_failure_pending
                 or (
                     task.last_failure_event_id is not None
-                    and task.max_retries is not None
-                    and task.retryable_failures > task.max_retries
+                    and retry_budget_exhausted(task)
                 )
                 or any(
                     self.tasks[dependency_id].status != "completed"
@@ -551,11 +561,32 @@ def _end_assignment_accounting(
         record.ended_event_id = event_id
 
 
+def retry_grant_used(task: TaskRecord) -> int:
+    """Attempts ended, by failure or a lost worker, since the last human retry."""
+    return task.retryable_failures + task.lease_expiries - task.retry_grant_base
+
+
+def lease_allowance_exhausted(task: TaskRecord) -> bool:
+    return (
+        task.retry_grant is None
+        and task.max_lease_expiries is not None
+        and task.lease_expiries > task.max_lease_expiries
+    )
+
+
 def retry_budget_exhausted(task: TaskRecord) -> bool:
+    """No further automatic attempt is allowed.
+
+    Without a human retry, that is the retry budget or the lost-worker
+    allowance running out. After one, it is the grant's single count; for a
+    task with no lease policy the two rules give the same answer.
+    """
+    if task.retry_grant is not None:
+        return retry_grant_used(task) >= task.retry_grant
     return (
         task.max_retries is not None
         and task.retryable_failures > task.max_retries
-    )
+    ) or lease_allowance_exhausted(task)
 
 
 def _deadline_reached(task: TaskRecord, timestamp: float) -> bool:
@@ -791,6 +822,15 @@ def _apply_task_created(
             return False
     else:
         return False
+    lease_policy = payload.get("lease_policy")
+    if lease_policy is None:
+        max_lease_expiries = None
+    elif isinstance(lease_policy, dict):
+        max_lease_expiries = _nonnegative_int(lease_policy.get("max_expiries"))
+        if max_lease_expiries is None:
+            return False
+    else:
+        return False
     context = payload.get("context", {})
     if not isinstance(context, dict):
         return False
@@ -890,6 +930,7 @@ def _apply_task_created(
         deadline_at=deadline_at,
         depends_on=tuple(depends_on),
         max_retries=max_retries,
+        max_lease_expiries=max_lease_expiries,
         required_capabilities=required,
         context=dict(context),
         external_origin=(
@@ -1561,7 +1602,10 @@ def _apply_task_assignment_expired(
     task.last_failure_event_id = event_id
     task.last_failure_code = "assignment_expired"
     task.last_failure_reason = payload.get("reason")
-    task.retryable_failures += 1
+    if task.max_lease_expiries is None:
+        task.retryable_failures += 1
+    else:
+        task.lease_expiries += 1
     task.permanent_failure_pending = False
     task.status = "open"
     task.status_event_id = event_id
@@ -1686,6 +1730,8 @@ def _apply_task_retry_requested(
     # a permanent failure it deliberately does not restore the unused
     # automatic budget that the permanent classification bypassed.
     task.max_retries = task.retryable_failures + additional_retries - 1
+    task.retry_grant = additional_retries
+    task.retry_grant_base = task.retryable_failures + task.lease_expiries
     task.retry_not_before = None
     task.status = "open"
     task.status_event_id = event_id

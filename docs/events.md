@@ -73,6 +73,10 @@ earlier releases still replays:
 - The optional `fairness` evidence object on new assignments, identifying the
   `workflow_round_robin_v1` policy and the preceding accepted assignment event
   (since v0.10). Historical assignments without it remain replayable.
+- `payload.lease_policy` on `task.created` (after v0.14.1), an object with a
+  non-negative integer `max_expiries`, materialized by the server when
+  omitted. Tasks without it keep the earlier rule that a lease expiry consumes
+  a retry.
 - The optional `payload.retry_after_seconds` on a retryable
   `task.attempt_failed` (after v0.14.1): a positive number of at most 604,800
   that delays the next assignment until that long after the event. Failures

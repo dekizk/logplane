@@ -27,6 +27,7 @@ from logplane.projection import (
     TASK_TERMINAL_STATUSES,
     apply_event,
     dependency_terminal_event_id,
+    lease_allowance_exhausted,
     retry_budget_exhausted,
 )
 
@@ -45,6 +46,46 @@ class OrderedProjectionCursor:
     # the task's retry time. Process-local planning aids, never replayed state.
     latest_event_ts: float = 0.0
     retry_holds: dict[int, float] = field(default_factory=dict)
+    # When this coordinator last looked at the log, and until when it holds
+    # time-based lease expiry. After it has not been looking (start-up, a
+    # suspended laptop, a bus outage) an old heartbeat means "not seen", not
+    # "not sent", so workers get one lease period to be heard from first.
+    last_observed_at: Optional[float] = None
+    lease_grace_until: float = 0.0
+    reconnect_grace_until: Optional[float] = None
+
+    def begin_lease_grace(self, now: float, lease_seconds: float) -> None:
+        self.lease_grace_until = max(self.lease_grace_until, now + lease_seconds)
+        self.last_observed_at = now
+
+    def reconnected(self, now: float, lease_seconds: float) -> bool:
+        """The event stream was re-established; return whether grace began.
+
+        While it was down, heartbeats could not be read however short the
+        outage. A stream that keeps dropping must not hold expiry forever, so
+        a reconnect neither extends the grace an earlier reconnect began nor
+        starts one within a lease period of that one ending: there is always a
+        window in which a worker that really is silent gets expired. A grace
+        begun at start-up or by a long gap does not count against a reconnect.
+        """
+        self.last_observed_at = now
+        previous = self.reconnect_grace_until
+        if previous is not None and now < previous + lease_seconds:
+            return False
+        self.reconnect_grace_until = now + lease_seconds
+        self.lease_grace_until = max(self.lease_grace_until, now + lease_seconds)
+        return True
+
+    def observe(self, now: float, lease_seconds: float) -> Optional[float]:
+        """Note one look at the log; return the gap if it started a grace period."""
+        previous, self.last_observed_at = self.last_observed_at, now
+        if previous is None:
+            return None
+        gap = now - previous
+        if gap > max(lease_seconds, MIN_OBSERVATION_GAP_SECONDS):
+            self.lease_grace_until = max(self.lease_grace_until, now + lease_seconds)
+            return gap
+        return None
 
     def consume(self, events: Iterable[dict]) -> list[tuple[dict, bool]]:
         consumed: list[tuple[dict, bool]] = []
@@ -70,6 +111,11 @@ class OrderedProjectionCursor:
             topics=list(PM_TOPICS),
         )
         return self.consume(events)
+
+
+# An idle coordinator is woken by the bus's keepalive every 15 seconds, so a
+# longer silence than this means it was not looking, whatever the lease is.
+MIN_OBSERVATION_GAP_SECONDS = 20.0
 
 
 def _lock_path() -> Path:
@@ -230,11 +276,15 @@ def plan_next_emission(
     default_workflow_reserve_cost_usd_per_assignment: object = _UNSET_POLICY_DEFAULT,
     *,
     skip_assignment_task_ids: frozenset[int] = frozenset(),
+    hold_lease_expiry: bool = False,
 ) -> Optional[dict]:
     """Return the next deterministic effect needed to reconcile derived state.
 
     ``skip_assignment_task_ids`` names open tasks not to assign in this plan;
     ``reconcile`` uses it to hold a retry the bus's clock says is too early.
+    ``hold_lease_expiry`` suppresses expiry for a stale heartbeat alone, while
+    the coordinator cannot yet tell silence from not having looked; a replaced
+    or unregistered worker still expires.
     """
     for task_id in sorted(state.tasks):
         task = state.tasks[task_id]
@@ -410,6 +460,8 @@ def plan_next_emission(
         elif worker.instance_id != task.worker_instance_id:
             reason = "worker process was replaced"
         elif now - worker.last_seen > lease_seconds:
+            if hold_lease_expiry:
+                continue
             reason = "worker lease expired"
         else:
             continue
@@ -475,6 +527,18 @@ def plan_next_emission(
             reason = (
                 task.last_failure_reason
                 or "worker reported a permanent failure"
+            )
+        elif task.retry_grant is not None:
+            reason_code = "retry_budget_exhausted"
+            reason = (
+                f"the {task.retry_grant} further attempt(s) granted by the last "
+                "retry request ended without completing"
+            )
+        elif lease_allowance_exhausted(task):
+            reason_code = "lease_expiry_limit_exhausted"
+            reason = (
+                f"the task lost its worker {task.lease_expiries} times; its lease "
+                f"policy allows {task.max_lease_expiries}"
             )
         else:
             reason_code = "retry_budget_exhausted"
@@ -762,6 +826,18 @@ def plan_next_emission(
     return None
 
 
+def _note_observation(
+    cursor: OrderedProjectionCursor, at: float, lease_seconds: float
+) -> None:
+    gap = cursor.observe(at, lease_seconds)
+    if gap is not None:
+        print(
+            f"[pm] was not watching the log for {gap:.0f}s; giving workers "
+            f"{lease_seconds:g}s to be heard from before expiring leases",
+            flush=True,
+        )
+
+
 def _held_retries(
     state: PMState, holds: dict[int, float], bus_time: float
 ) -> frozenset[int]:
@@ -797,6 +873,9 @@ def reconcile(
     for _ in range(10_000):
         current_time = now if now is not None else clock()
         if cursor is not None:
+            # On every reading of the clock, not once per pass: the machine
+            # can be suspended between two steps of the same pass.
+            _note_observation(cursor, current_time, lease_seconds)
             bus_time = max(bus_time, cursor.latest_event_ts)
         planned = plan_next_emission(
             state,
@@ -811,6 +890,9 @@ def reconcile(
             default_workflow_reserve_tokens_per_assignment,
             default_workflow_reserve_cost_usd_per_assignment,
             skip_assignment_task_ids=_held_retries(state, retry_holds, bus_time),
+            hold_lease_expiry=(
+                cursor is not None and current_time < cursor.lease_grace_until
+            ),
         )
         if planned is None:
             return emitted
@@ -818,14 +900,22 @@ def reconcile(
             cursor is not None
             and planned["topic"] == "task.assignment_expired"
             and planned["payload"].get("reason") == "worker lease expired"
-            and cursor.catch_up(bus)
         ):
             # The PM applies events one at a time. When it falls behind the
             # log (a busy host, a burst of events), a heartbeat the worker
             # already sent may still be unread, and expiring now would retry
             # work a live worker is still doing. Read to the head of the log
             # and plan again; expire only if the lease is still stale.
-            continue
+            if cursor.catch_up(bus):
+                continue
+            # That read takes time too. If the machine was suspended during
+            # it, the plan was made before a gap in which no heartbeat could
+            # be seen: drop it and plan again under the grace the gap starts.
+            if now is None:
+                after_read = clock()
+                _note_observation(cursor, after_read, lease_seconds)
+                if after_read < cursor.lease_grace_until:
+                    continue
         publish_options = {
             "caused_by": planned.get("caused_by"),
             "idempotency_key": planned["idempotency_key"],
@@ -922,6 +1012,9 @@ def main(snapshot_path: Optional[Path] = None):
         cursor = initial_cursor(bus, snapshot_path)
         state = cursor.state
         print(f"[pm] replayed log up to #{cursor.last_event_id}, then reconciling...", flush=True)
+        # Heartbeats sent while no coordinator was running are not in the log's
+        # recent past; do not read that silence as dead workers.
+        cursor.begin_lease_grace(time.time(), WORKER_LEASE_SECONDS)
 
         policy_defaults = {
             "default_workflow_max_active_assignments": (
@@ -957,9 +1050,18 @@ def main(snapshot_path: Optional[Path] = None):
             **policy_defaults,
         )
 
+        def stream_reconnected() -> None:
+            if cursor.reconnected(time.time(), WORKER_LEASE_SECONDS):
+                print(
+                    "[pm] reconnected to the bus; giving workers "
+                    f"{WORKER_LEASE_SECONDS:g}s to be heard from before expiring leases",
+                    flush=True,
+                )
+
         for event in bus.subscribe(
             from_id=cursor.last_event_id,
             topics=list(PM_TOPICS),
+            on_reconnect=stream_reconnected,
             on_idle=lambda: reconcile(
                 state,
                 bus,

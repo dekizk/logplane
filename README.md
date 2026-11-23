@@ -230,10 +230,11 @@ logplane submit "Write docs" --depends-on 1                         # task 3
 logplane submit "Ship it" --depends-on 2 --depends-on 3             # task 4
 ```
 
-A lease expiry or retryable failure consumes one retry, and `submit` defaults
-to no retries. If you plan to use `--fail` or kill a worker mid-task, submit
-with `--max-retries 2` (or higher) so the next attempt is allowed; otherwise
-the task correctly ends `failed`.
+A retryable failure consumes one retry, and `submit` defaults to no retries.
+If you plan to use `--fail`, submit with `--max-retries 2` (or higher) so the
+next attempt is allowed; otherwise the task correctly ends `failed`. Losing a
+worker mid-task is counted separately: a task survives three lost workers by
+default before it fails.
 
 ## Everyday commands
 

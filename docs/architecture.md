@@ -229,12 +229,21 @@ available.
 The PM also reconciles on SSE keepalives, so lease expiry does not depend on a
 new task or heartbeat arriving after a worker dies.
 
+Lease age is the PM's clock against the last heartbeat it has read, so a PM
+that was not reading cannot judge it. At start-up, when its event stream
+reconnects, and after any gap in its own observation longer than a lease, the
+PM holds expiry for silence for one lease period. This is process-local planning, like the single-PM lock: the expiry
+events it eventually emits are the only record. A lease expiry is charged to
+the task's lease policy, not its retry budget; see
+[bounded retries](operations.md#bounded-retries-and-terminal-failure).
+
 Defaults can be changed with:
 
 ```sh
 LOGPLANE_HEARTBEAT_SECONDS=5
 LOGPLANE_WORKER_LEASE_SECONDS=20
 LOGPLANE_MAX_RETRIES=2
+LOGPLANE_MAX_LEASE_EXPIRIES=3
 LOGPLANE_URL=http://127.0.0.1:8765
 ```
 
