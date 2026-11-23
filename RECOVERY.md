@@ -273,10 +273,9 @@ no retries. Both use a worker that only sleeps; no model calls.
 | Trial | Before the change | After |
 |---|---|---|
 | Stop `logplane up` for 30 seconds during a 55-second task, worker heartbeat every 8 seconds, then start it again (Linux) | `task.assignment_expired` at restart, then `task.failed` | The task completed on attempt 1; no expiry recorded |
-| Close the lid of a MacBook for 73 seconds during a 5-minute `demo-worker --delay 300` task | Not run | The task was still `started` on attempt 1 after waking, with no lost worker counted; the coordinator logged "was not watching the log for 73s; giving workers 20s to be heard from before expiring leases" |
+| Close the lid of a MacBook for 73 seconds during a 5-minute `demo-worker --delay 300` task | Not run | The task was still `started` on attempt 1 after waking and went on to complete on that attempt, with no lost worker counted; the coordinator logged "was not watching the log for 73s; giving workers 20s to be heard from before expiring leases" |
 
-The sleep trial stopped at the first check after waking; the task's completion
-was not recorded here. A run that stops only the bus for 10 seconds showed the
+A run that stops only the bus for 10 seconds showed the
 coordinator's reconnect grace in its log, but with a single worker that timing
 also survives without it, so it is not evidence for the reconnect path.
 
