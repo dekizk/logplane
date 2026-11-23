@@ -288,9 +288,13 @@ starts, when its event stream reconnects after any break, and when it has not
 looked at the log for longer than a lease (a suspended laptop). It then waits
 one lease period for workers to be heard from before expiring any lease for
 silence alone; a worker whose process was replaced is still expired at once.
-A stream that keeps dropping cannot hold expiry indefinitely: a reconnect
-does not extend the grace an earlier reconnect began, or start one within a
-lease period of that one ending. A suspension shorter than a lease with no reconnect
+A reconnect does not extend the grace an earlier reconnect began, or start one
+within a lease period of that one ending, so a stream that drops every few
+seconds still leaves windows in which a silent worker is expired. That is not
+a guarantee: the coordinator only checks leases when it gets to look at the
+log, so if every look comes after a break longer than a lease, each one starts
+a new grace and a silent worker stays assigned until the connection holds for
+a lease period. A suspension shorter than a lease with no reconnect
 gets no grace, so a worker whose last heartbeat was already a few seconds old
 can still be expired after one.
 

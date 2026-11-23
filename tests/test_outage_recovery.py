@@ -324,6 +324,54 @@ class LeaseGraceTests(unittest.TestCase):
         self.assertEqual(185.0, cursor.lease_grace_until)
         self.assertEqual("assigned", cursor.state.tasks[1].status)
 
+    def test_a_suspension_during_the_final_read_before_expiry_drops_the_plan(self):
+        cursor, log = self.start()
+        clock = {"now": 121.0}
+        cursor.observe(119.0, 20)
+
+        class SlowRead(LogBus):
+            def query_all(self, after_id=0, topics=None):
+                # Nothing new to read, but the machine sleeps while reading.
+                clock["now"] = 181.0
+                return super().query_all(after_id, topics)
+
+        slow = SlowRead(starting_id=4, ts=181.0)
+        with redirect_stdout(io.StringIO()):
+            emitted = reconcile(cursor.state, slow, lease_seconds=20, cursor=cursor,
+                                clock=lambda: clock["now"])
+        self.assertEqual([], emitted)   # 21s stale at 121, but not expired at 181
+        self.assertEqual(201.0, cursor.lease_grace_until)
+        self.assertEqual("assigned", cursor.state.tasks[1].status)
+        # Still silent once the grace ends: now it is expired.
+        clock["now"] = 190.0
+        self.assertEqual([], reconcile(cursor.state, log, lease_seconds=20, cursor=cursor,
+                                       clock=lambda: clock["now"]))
+        clock["now"] = 201.0
+        log.ts = 201.0
+        topics = [item["topic"] for item in reconcile(
+            cursor.state, log, lease_seconds=20, cursor=cursor, clock=lambda: clock["now"])]
+        self.assertIn("task.assignment_expired", topics)
+
+    def test_an_ordinary_empty_read_before_expiry_still_expires(self):
+        cursor, log = self.start()
+        clock = {"now": 119.0}
+        reconcile(cursor.state, log, lease_seconds=20, cursor=cursor, clock=lambda: clock["now"])
+        clock["now"] = 121.0
+        log.ts = 121.0
+        topics = [item["topic"] for item in reconcile(
+            cursor.state, log, lease_seconds=20, cursor=cursor, clock=lambda: clock["now"])]
+        self.assertIn("task.assignment_expired", topics)
+
+    def test_looks_that_each_follow_a_long_break_keep_renewing_the_grace(self):
+        # A documented limit, not a guarantee: with every look more than a lease
+        # after the last, a silent worker is never judged.
+        cursor, log = self.start()
+        for now in (110.0, 151.0, 192.0, 233.0):
+            with self.subTest(now=now), redirect_stdout(io.StringIO()):
+                cursor.reconnected(now, 20)
+                self.assertEqual([], self.run_at(cursor, log, now))
+        self.assertEqual("assigned", cursor.state.tasks[1].status)
+
     def test_a_reconnect_starts_the_grace_however_short_the_outage(self):
         # Heartbeat at 100; the stream drops and is back within the lease.
         cursor, log = self.start()

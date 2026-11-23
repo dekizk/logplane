@@ -1133,8 +1133,8 @@ def _format_task(value: dict) -> str:
             else ""
         )
         + (
-            f" · {value['retry_grant']['used']} of {value['retry_grant']['attempts']} "
-            "granted attempts ended"
+            f" · retry grant of {value['retry_grant']['attempts']} attempt(s), "
+            f"{value['retry_grant']['used']} failed or lost so far"
             if value.get("retry_grant") is not None
             else ""
         ),

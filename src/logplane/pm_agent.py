@@ -826,6 +826,18 @@ def plan_next_emission(
     return None
 
 
+def _note_observation(
+    cursor: OrderedProjectionCursor, at: float, lease_seconds: float
+) -> None:
+    gap = cursor.observe(at, lease_seconds)
+    if gap is not None:
+        print(
+            f"[pm] was not watching the log for {gap:.0f}s; giving workers "
+            f"{lease_seconds:g}s to be heard from before expiring leases",
+            flush=True,
+        )
+
+
 def _held_retries(
     state: PMState, holds: dict[int, float], bus_time: float
 ) -> frozenset[int]:
@@ -863,13 +875,7 @@ def reconcile(
         if cursor is not None:
             # On every reading of the clock, not once per pass: the machine
             # can be suspended between two steps of the same pass.
-            gap = cursor.observe(current_time, lease_seconds)
-            if gap is not None:
-                print(
-                    f"[pm] was not watching the log for {gap:.0f}s; giving workers "
-                    f"{lease_seconds:g}s to be heard from before expiring leases",
-                    flush=True,
-                )
+            _note_observation(cursor, current_time, lease_seconds)
             bus_time = max(bus_time, cursor.latest_event_ts)
         planned = plan_next_emission(
             state,
@@ -894,14 +900,22 @@ def reconcile(
             cursor is not None
             and planned["topic"] == "task.assignment_expired"
             and planned["payload"].get("reason") == "worker lease expired"
-            and cursor.catch_up(bus)
         ):
             # The PM applies events one at a time. When it falls behind the
             # log (a busy host, a burst of events), a heartbeat the worker
             # already sent may still be unread, and expiring now would retry
             # work a live worker is still doing. Read to the head of the log
             # and plan again; expire only if the lease is still stale.
-            continue
+            if cursor.catch_up(bus):
+                continue
+            # That read takes time too. If the machine was suspended during
+            # it, the plan was made before a gap in which no heartbeat could
+            # be seen: drop it and plan again under the grace the gap starts.
+            if now is None:
+                after_read = clock()
+                _note_observation(cursor, after_read, lease_seconds)
+                if after_read < cursor.lease_grace_until:
+                    continue
         publish_options = {
             "caused_by": planned.get("caused_by"),
             "idempotency_key": planned["idempotency_key"],
