@@ -111,6 +111,17 @@ more assignments concurrently than it advertises. Unexpected Python
 exceptions default to permanent failure; applications may explicitly configure
 them as retryable.
 
+When a failure has a known recovery time, say so, and Logplane holds the retry
+until then instead of retrying at once:
+
+```python
+return RetryableFailure("usage_limit", "limit resets at 14:50",
+                        retry_after_seconds=2400)
+```
+
+CLI and HTTP agents put the same optional `retry_after_seconds` in a
+`retryable_failure` outcome.
+
 ### Subprocess agents
 
 The configured CLI adapter uses protocol v1. It sends one strict envelope on
@@ -193,6 +204,8 @@ config file.
 
 HTTP `408`, `425`, `429`, transport errors, and `5xx` responses are retryable;
 other `4xx` responses and malformed outcomes are permanent attempt failures.
+A `Retry-After` header given in seconds on a retryable status delays the next
+attempt by that long; the date form is ignored.
 Cancellation delivery is best-effort. The runtime's ownership fence remains
 authoritative and suppresses late output even if a remote agent cannot stop.
 The copyable loopback implementation in `examples/http_agent/` includes a

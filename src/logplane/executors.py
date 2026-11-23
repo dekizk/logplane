@@ -18,7 +18,7 @@ from logplane.executor_protocol import (
     parse_outcome_message,
     validate_protocol_version,
 )
-from logplane.limits import MAX_TASK_DEPENDENCIES
+from logplane.limits import MAX_RETRY_AFTER_SECONDS, MAX_TASK_DEPENDENCIES
 
 DEFAULT_MAX_PROTOCOL_BYTES = 64 * 1024
 
@@ -448,12 +448,33 @@ class Blocked:
 
 @dataclass(frozen=True)
 class RetryableFailure:
+    """A failure worth another attempt.
+
+    ``retry_after_seconds`` asks Logplane not to start the next attempt before
+    that long has passed, for a failure with a known recovery time (a
+    provider's usage limit, a ``Retry-After``). The retry still counts against
+    the task's retry budget.
+    """
+
     code: str
     reason: str
+    retry_after_seconds: Optional[float] = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.code, "code")
         _nonempty_string(self.reason, "reason")
+        delay = self.retry_after_seconds
+        if delay is not None:
+            if (
+                not isinstance(delay, (int, float))
+                or isinstance(delay, bool)
+                or not math.isfinite(delay)
+                or not 0 < delay <= MAX_RETRY_AFTER_SECONDS
+            ):
+                raise ValueError(
+                    "retry_after_seconds must be a positive number of at most "
+                    f"{MAX_RETRY_AFTER_SECONDS} seconds"
+                )
 
 
 @dataclass(frozen=True)
@@ -499,6 +520,7 @@ def outcome_from_dict(value: object) -> Outcome:
         return RetryableFailure(
             code=value.get("code"),
             reason=value.get("reason"),
+            retry_after_seconds=value.get("retry_after_seconds"),
         )
     if status == "permanent_failure":
         return PermanentFailure(

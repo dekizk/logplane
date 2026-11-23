@@ -105,6 +105,12 @@ Each call is bounded by a worker timeout, a turn limit (`--max-turns`, default
 Timeouts and cancellation terminate the whole process group. Charges already
 incurred cannot be undone.
 
+When Claude Code reports a plan usage limit ("You've hit your 5-hour limit ·
+resets 2:50pm"), the attempt ends as the retryable `claude_usage_limit` with a
+wait until the reset time plus a minute, or 30 minutes when no time can be
+read. Logplane holds the task until then; the retry needs the task to have a
+retry left.
+
 Results come back through Claude Code's structured output (`--json-schema`), so
 the outcome is validated rather than parsed out of free text. If a run finishes
 without structured output, the adapter accepts a reply that is exactly the

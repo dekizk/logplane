@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import selectors
 import shlex
 import signal
@@ -47,15 +48,17 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from logplane.executors import (
     AssignmentContext, Outcome, PermanentFailure, RetryableFailure,
     json_size, outcome_from_dict,
 )
 from logplane.gate import WAITING_DIRECTORY, approval_pending, gate_environment
-from logplane.limits import MAX_INLINE_RESULT_BYTES
+from logplane.limits import MAX_INLINE_RESULT_BYTES, MAX_RETRY_AFTER_SECONDS
 
 AUTH_MODES = ("login", "api-key")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -83,6 +86,59 @@ FORBIDDEN_TOOLS = frozenset({
 GATEABLE_TOOLS = ("Bash", "Edit", "MultiEdit", "Write", "NotebookEdit", "WebFetch", "WebSearch")
 GATED_COMPANIONS = {"Bash": ("BashOutput", "KillShell")}
 DEFAULT_GATE_COMMAND = (sys.executable, "-m", "logplane", "gate", "claude-hook")
+
+
+# A usage limit is worth waiting out, not failing on. The wait runs to the reset
+# time the message names, plus a margin; without a readable time, a default.
+USAGE_LIMIT_DEFAULT_WAIT = 1800.0
+USAGE_LIMIT_MARGIN = 60.0
+_USAGE_LIMIT = re.compile(r"(hit|reached) your\b.{0,40}\blimit|\blimit reached\b|\busage limit\b", re.I)
+_LIMIT_RESET = re.compile(
+    r"resets?\s+(?:at\s+)?"
+    r"(?:(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+    r"(?:\s*\((?P<zone>[A-Za-z0-9_+\-/]+)\))?", re.I)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def usage_limit_wait(message: object, now: Optional[float] = None) -> Optional[float]:
+    """Seconds to wait when ``message`` reports a usage limit; ``None`` if it does not.
+
+    Reads messages such as "You've hit your 5-hour limit · resets 2:50pm
+    (Australia/Brisbane)". A reset time with no date means its next occurrence.
+    """
+    text = str(message)
+    if not _USAGE_LIMIT.search(text):
+        return None
+    found = _LIMIT_RESET.search(text)
+    if found is None:
+        return USAGE_LIMIT_DEFAULT_WAIT
+    now = time.time() if now is None else now
+    try:
+        zone = ZoneInfo(found["zone"]) if found["zone"] else None
+    except (KeyError, ValueError, OSError):
+        zone = None
+    # With a named zone these are aware datetimes in it; without one they are
+    # naive local times, which timestamp() below resolves by the host's rules
+    # for the reset's own date, not by today's offset.
+    current = datetime.fromtimestamp(now, zone)
+    try:
+        hour = int(found["hour"]) % 12 + (12 if found["ampm"].lower() == "pm" else 0)
+        reset = current.replace(hour=hour, minute=int(found["minute"] or 0),
+                                second=0, microsecond=0)
+        if found["month"]:
+            reset = reset.replace(month=_MONTHS.index(found["month"][:3].lower()) + 1,
+                                  day=int(found["day"]))
+            if reset < current - timedelta(days=1):
+                reset = reset.replace(year=reset.year + 1)
+        elif reset <= current:
+            reset += timedelta(days=1)
+    except ValueError:
+        return USAGE_LIMIT_DEFAULT_WAIT
+    # Elapsed time between the two instants. Subtracting the local datetimes
+    # would ignore a daylight-saving change between now and the reset.
+    wait = reset.timestamp() - now + USAGE_LIMIT_MARGIN
+    return min(max(wait, USAGE_LIMIT_MARGIN), MAX_RETRY_AFTER_SECONDS)
 
 
 def conflicting_auth_variables(environment: dict, auth: str) -> list[str]:
@@ -362,6 +418,12 @@ def parse_result(returncode: int, stdout: bytes, *,
                                 "Claude Code reached its per-call spending limit"), report
     if returncode != 0 or envelope.get("is_error") is True or subtype != "success":
         detail = _brief(envelope.get("result") or f"exit {returncode}, subtype {subtype}")
+        wait = usage_limit_wait(envelope.get("result") or "")
+        if wait is not None:
+            report["usage_limit_wait_seconds"] = round(wait)
+            return RetryableFailure(
+                "claude_usage_limit", f"Claude Code hit a usage limit: {detail}",
+                retry_after_seconds=wait), report
         return PermanentFailure("claude_failed", f"Claude Code failed: {detail}"), report
     try:
         if isinstance(envelope.get("structured_output"), dict):

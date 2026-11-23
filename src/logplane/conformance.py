@@ -193,6 +193,11 @@ def _outcome_payload(outcome) -> dict:
             "status": "retryable_failure",
             "code": outcome.code,
             "reason": outcome.reason,
+            **(
+                {"retry_after_seconds": outcome.retry_after_seconds}
+                if outcome.retry_after_seconds is not None
+                else {}
+            ),
         }
     if isinstance(outcome, PermanentFailure):
         return {
