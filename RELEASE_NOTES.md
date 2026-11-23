@@ -8,11 +8,13 @@
   instead of the retry budget, and a task that loses more workers than allowed
   fails with `lease_expiry_limit_exhausted`. Tasks created earlier keep the old
   rule, so existing histories replay unchanged. `logplane task` shows the
-  count.
+  count. After `logplane retry`, `--additional-retries N` allows exactly N
+  further assignments in total, however each one ends.
 - **A coordinator that was not watching no longer expires live work.** At
-  start-up, and after it has not looked at the log for longer than a lease (a
-  suspended laptop, a bus outage), the coordinator waits one lease period for
-  workers to be heard from before expiring a lease for silence. Restarting
+  start-up, when its event stream reconnects, and after it has not looked at
+  the log for longer than a lease (a suspended laptop), the coordinator waits
+  one lease period for workers to be heard from before expiring a lease for
+  silence. `BusClient.subscribe` gains an optional `on_reconnect` callback. Restarting
   `logplane up` during a long task used to expire it, and with no retries fail
   it; it now completes on the same attempt.
 - **A retryable failure can ask for a wait.** `RetryableFailure` gains an

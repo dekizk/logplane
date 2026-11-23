@@ -52,10 +52,29 @@ class OrderedProjectionCursor:
     # "not sent", so workers get one lease period to be heard from first.
     last_observed_at: Optional[float] = None
     lease_grace_until: float = 0.0
+    reconnect_grace_until: Optional[float] = None
 
     def begin_lease_grace(self, now: float, lease_seconds: float) -> None:
         self.lease_grace_until = max(self.lease_grace_until, now + lease_seconds)
         self.last_observed_at = now
+
+    def reconnected(self, now: float, lease_seconds: float) -> bool:
+        """The event stream was re-established; return whether grace began.
+
+        While it was down, heartbeats could not be read however short the
+        outage. A stream that keeps dropping must not hold expiry forever, so
+        a reconnect neither extends the grace an earlier reconnect began nor
+        starts one within a lease period of that one ending: there is always a
+        window in which a worker that really is silent gets expired. A grace
+        begun at start-up or by a long gap does not count against a reconnect.
+        """
+        self.last_observed_at = now
+        previous = self.reconnect_grace_until
+        if previous is not None and now < previous + lease_seconds:
+            return False
+        self.reconnect_grace_until = now + lease_seconds
+        self.lease_grace_until = max(self.lease_grace_until, now + lease_seconds)
+        return True
 
     def observe(self, now: float, lease_seconds: float) -> Optional[float]:
         """Note one look at the log; return the gap if it started a grace period."""
@@ -509,6 +528,12 @@ def plan_next_emission(
                 task.last_failure_reason
                 or "worker reported a permanent failure"
             )
+        elif task.retry_grant is not None:
+            reason_code = "retry_budget_exhausted"
+            reason = (
+                f"the {task.retry_grant} further attempt(s) granted by the last "
+                "retry request ended without completing"
+            )
         elif lease_allowance_exhausted(task):
             reason_code = "lease_expiry_limit_exhausted"
             reason = (
@@ -833,17 +858,18 @@ def reconcile(
     emitted: list[dict] = []
     retry_holds = cursor.retry_holds if cursor is not None else {}
     bus_time = cursor.latest_event_ts if cursor is not None else 0.0
-    if cursor is not None:
-        gap = cursor.observe(now if now is not None else clock(), lease_seconds)
-        if gap is not None:
-            print(
-                f"[pm] was not watching the log for {gap:.0f}s; giving workers "
-                f"{lease_seconds:g}s to be heard from before expiring leases",
-                flush=True,
-            )
     for _ in range(10_000):
         current_time = now if now is not None else clock()
         if cursor is not None:
+            # On every reading of the clock, not once per pass: the machine
+            # can be suspended between two steps of the same pass.
+            gap = cursor.observe(current_time, lease_seconds)
+            if gap is not None:
+                print(
+                    f"[pm] was not watching the log for {gap:.0f}s; giving workers "
+                    f"{lease_seconds:g}s to be heard from before expiring leases",
+                    flush=True,
+                )
             bus_time = max(bus_time, cursor.latest_event_ts)
         planned = plan_next_emission(
             state,
@@ -1010,9 +1036,18 @@ def main(snapshot_path: Optional[Path] = None):
             **policy_defaults,
         )
 
+        def stream_reconnected() -> None:
+            if cursor.reconnected(time.time(), WORKER_LEASE_SECONDS):
+                print(
+                    "[pm] reconnected to the bus; giving workers "
+                    f"{WORKER_LEASE_SECONDS:g}s to be heard from before expiring leases",
+                    flush=True,
+                )
+
         for event in bus.subscribe(
             from_id=cursor.last_event_id,
             topics=list(PM_TOPICS),
+            on_reconnect=stream_reconnected,
             on_idle=lambda: reconcile(
                 state,
                 bus,

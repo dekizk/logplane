@@ -15,6 +15,7 @@ from logplane.projection import (
     lease_allowance_exhausted,
     replay_events,
     retry_budget_exhausted,
+    retry_grant_used,
 )
 
 
@@ -29,6 +30,8 @@ def build_projection(events: Iterable[dict]) -> CoordinationProjection:
 
 def retries_remaining(task: TaskRecord) -> Optional[int]:
     """Return remaining automatic retries, or None for a legacy unbounded task."""
+    if task.retry_grant is not None:
+        return max(0, task.retry_grant - 1 - retry_grant_used(task))
     if task.max_retries is None:
         return None
     return max(0, task.max_retries - task.retryable_failures)
@@ -649,7 +652,14 @@ def task_view(
         "lease_policy": {
             "max_expiries": task.max_lease_expiries,
             "expiries": task.lease_expiries,
+            # After a human retry one shared count applies instead.
+            "in_force": task.retry_grant is None,
         },
+        "retry_grant": (
+            None
+            if task.retry_grant is None
+            else {"attempts": task.retry_grant, "used": retry_grant_used(task)}
+        ),
         "deadline_at": task.deadline_at,
         "decision": {
             "needed": task.decision_needed,

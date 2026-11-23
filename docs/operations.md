@@ -278,16 +278,21 @@ then ends `task.failed` with `lease_expiry_limit_exhausted`. A task that kills
 its worker every time therefore still stops. `logplane task` shows the count
 as "lost workers 1 of 3 allowed". Tasks created before this policy existed
 keep the old rule, where a lease expiry consumes a retry. `logplane retry`
-reopens a task that ran out of either allowance.
+reopens a task that ran out of either allowance, and its
+`--additional-retries N` then allows exactly N further assignments in total,
+whether each ends in a failure or a lost worker.
 
-The coordinator also avoids expiring leases it cannot judge. When it starts,
-or when it has not looked at the log for longer than a lease (a suspended
-laptop, a bus outage), old heartbeats mean it was not watching, not that
-workers died. It then waits one lease period for workers to be heard from
-before expiring any lease for silence alone; a worker whose process was
-replaced is still expired at once. A stall shorter than a lease gets no such
-grace, so a worker whose last heartbeat was already a few seconds old can
-still be expired after one.
+The coordinator also avoids expiring leases it cannot judge. Old heartbeats
+mean it was not watching, not that workers died, in three cases: when it
+starts, when its event stream reconnects after any break, and when it has not
+looked at the log for longer than a lease (a suspended laptop). It then waits
+one lease period for workers to be heard from before expiring any lease for
+silence alone; a worker whose process was replaced is still expired at once.
+A stream that keeps dropping cannot hold expiry indefinitely: a reconnect
+does not extend the grace an earlier reconnect began, or start one within a
+lease period of that one ending. A suspension shorter than a lease with no reconnect
+gets no grace, so a worker whose last heartbeat was already a few seconds old
+can still be expired after one.
 
 A retry normally starts as soon as a capable worker is free. A worker can
 instead ask for a wait, by reporting `retry_after_seconds` with a retryable

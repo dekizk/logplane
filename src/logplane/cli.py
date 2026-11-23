@@ -1129,6 +1129,13 @@ def _format_task(value: dict) -> str:
             f" · lost workers {value['lease_policy']['expiries']} of "
             f"{value['lease_policy']['max_expiries']} allowed"
             if value.get("lease_policy", {}).get("max_expiries") is not None
+            and value.get("retry_grant") is None
+            else ""
+        )
+        + (
+            f" · {value['retry_grant']['used']} of {value['retry_grant']['attempts']} "
+            "granted attempts ended"
+            if value.get("retry_grant") is not None
             else ""
         ),
     ]

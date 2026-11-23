@@ -1,19 +1,25 @@
 """Lost workers have their own allowance, and a coordinator that was not
 watching the log does not read old heartbeats as dead workers."""
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
+
+import httpx
 
 from logplane import bus
+from logplane.client import BusClient
 from logplane.event_validation import EventValidationError, validate_event
-from logplane.operations import explain_task
+from logplane.operations import explain_task, task_view
 from logplane.pm_agent import (
     MIN_OBSERVATION_GAP_SECONDS, OrderedProjectionCursor, plan_next_emission, reconcile,
 )
 from logplane.projection import PMState, replay_events
 from tests.test_pm_agent import (
-    FakeBus, assigned, attempt_failed, created, event, expired, registered,
+    FakeBus, assigned, attempt_failed, completed, created, event, expired, registered,
 )
 
 LONG_LEASE = 100_000
@@ -118,8 +124,101 @@ class LeaseAllowanceTests(unittest.TestCase):
                       caused_by=failed[-1]["id"])
         reopened = failed + [retry]
         task = replay_events(reopened).tasks[1]
-        self.assertEqual(("open", 1, 1), (task.status, task.lease_expiries, task.max_lease_expiries))
+        self.assertEqual(("open", 1, 1, 1),
+                         (task.status, task.lease_expiries, task.retry_grant, task.retry_grant_base))
         self.assertEqual("task.assigned", plan(reopened)["topic"])
+
+
+class RetryGrantTests(unittest.TestCase):
+    """A human retry grants N further assignments in total, whatever ends each."""
+
+    def failed_task(self, *, policy=True):
+        first = created(max_retries=0)
+        if policy:
+            with_lease_policy(first, 0)
+        events = [registered(), first, assigned(3, 1), attempt_failed(4, 1, retryable=True)]
+        return apply_plan(events, plan(events))
+
+    def grant(self, events, additional):
+        return events + [event(events[-1]["id"] + 1, "task.retry_requested", "human",
+                               {"task_id": 1, "reason": "try again", "additional_retries": additional},
+                               caused_by=events[-1]["id"])]
+
+    def run_attempts(self, events, endings):
+        """Assign and end attempts in turn; return the attempts assigned and the last plan."""
+        attempts = []
+        for ending in endings:
+            planned = plan(events)
+            if planned["topic"] != "task.assigned":
+                return attempts, planned, events
+            attempt = planned["payload"]["attempt"]
+            attempts.append(attempt)
+            next_id = events[-1]["id"] + 1
+            events = events + [assigned(next_id, attempt), ending(next_id + 1, attempt)]
+        return attempts, plan(events), events
+
+    def retryable(self, event_id, attempt):
+        return attempt_failed(event_id, attempt, retryable=True)
+
+    def test_a_grant_of_two_allows_exactly_two_assignments_however_they_end(self):
+        for label, endings in (
+            ("failure then lost worker", (self.retryable, expired, self.retryable)),
+            ("lost worker then failure", (expired, self.retryable, expired)),
+            ("two failures", (self.retryable, self.retryable, self.retryable)),
+            ("two lost workers", (expired, expired, expired)),
+        ):
+            with self.subTest(label):
+                attempts, final, events = self.run_attempts(
+                    self.grant(self.failed_task(), 2), endings)
+                self.assertEqual([2, 3], attempts)
+                self.assertEqual(("task.failed", "retry_budget_exhausted"),
+                                 (final["topic"], final["payload"]["reason_code"]))
+                self.assertIn("2 further attempt(s) granted", final["payload"]["reason"])
+                task = replay_events(apply_plan(events, final)).tasks[1]
+                self.assertEqual("failed", task.status)
+
+    def test_a_grant_of_one_allows_one_assignment(self):
+        attempts, final, _ = self.run_attempts(self.grant(self.failed_task(), 1),
+                                               (expired, expired))
+        self.assertEqual([2], attempts)
+        self.assertEqual("task.failed", final["topic"])
+
+    def test_a_task_without_a_lease_policy_behaves_as_it_did_before(self):
+        attempts, final, events = self.run_attempts(
+            self.grant(self.failed_task(policy=False), 2), (expired, self.retryable, expired))
+        self.assertEqual([2, 3], attempts)
+        self.assertEqual("retry_budget_exhausted", final["payload"]["reason_code"])
+        # The recorded numbers are the ones earlier releases wrote.
+        self.assertEqual((3, 2), (final["payload"]["retryable_failures"],
+                                  final["payload"]["max_retries"]))
+
+    def test_a_second_grant_starts_a_fresh_count(self):
+        _, final, events = self.run_attempts(self.grant(self.failed_task(), 1), (expired, expired))
+        again = self.grant(apply_plan(events, final), 2)
+        attempts, final, _ = self.run_attempts(again, (expired, self.retryable, expired))
+        self.assertEqual([3, 4], attempts)
+        self.assertEqual("task.failed", final["topic"])
+
+    def test_a_granted_attempt_can_still_complete(self):
+        attempts, final, events = self.run_attempts(self.grant(self.failed_task(), 2),
+                                                    (expired, completed))
+        self.assertEqual([2, 3], attempts)
+        self.assertIsNone(final)
+        self.assertEqual("completed", replay_events(events).tasks[1].status)
+
+    def test_the_views_count_what_is_left_of_a_grant(self):
+        events = self.grant(self.failed_task(), 2)
+        view = task_view(replay_events(events), 1, now=101.0, lease_seconds=LONG_LEASE)
+        self.assertEqual(({"attempts": 2, "used": 0}, 1, False),
+                         (view["retry_grant"], view["retry_policy"]["remaining"],
+                          view["lease_policy"]["in_force"]))
+        _, _, events = self.run_attempts(events, (expired,))
+        view = task_view(replay_events(events), 1, now=101.0, lease_seconds=LONG_LEASE)
+        self.assertEqual(({"attempts": 2, "used": 1}, 0),
+                         (view["retry_grant"], view["retry_policy"]["remaining"]))
+        fresh = [registered(), with_lease_policy(created(max_retries=1), 3)]
+        view = task_view(replay_events(fresh), 1, now=101.0, lease_seconds=LONG_LEASE)
+        self.assertEqual((None, True), (view["retry_grant"], view["lease_policy"]["in_force"]))
 
     def test_a_malformed_lease_policy_in_history_does_not_poison_replay(self):
         bad = created(max_retries=0)
@@ -209,6 +308,62 @@ class LeaseGraceTests(unittest.TestCase):
         self.assertEqual([], self.run_at(cursor, log, 102.0, lease=5))
         self.assertIn("task.assignment_expired", self.run_at(cursor, log, 117.0, lease=5))
 
+    def test_a_suspension_in_the_middle_of_a_pass_still_starts_the_grace(self):
+        cursor = OrderedProjectionCursor(PMState())
+        cursor.consume([registered(), registered(2, name="bob", instance="bob-1"),
+                        created(3, max_retries=2), assigned(4, 1), created(5, task_id=2)])
+        log = LogBus(starting_id=6, ts=105.0)
+        cursor.observe(100.0, 20)
+        # The first step of the pass reads 105 and assigns task 2; the machine is
+        # then suspended, and the next step of the same pass reads 165.
+        readings = iter([105.0] + [165.0] * 20)
+        with redirect_stdout(io.StringIO()):
+            emitted = reconcile(cursor.state, log, lease_seconds=20, cursor=cursor,
+                                clock=lambda: next(readings))
+        self.assertEqual(["task.assigned"], [item["topic"] for item in emitted])
+        self.assertEqual(185.0, cursor.lease_grace_until)
+        self.assertEqual("assigned", cursor.state.tasks[1].status)
+
+    def test_a_reconnect_starts_the_grace_however_short_the_outage(self):
+        # Heartbeat at 100; the stream drops and is back within the lease.
+        cursor, log = self.start()
+        self.assertEqual([], self.run_at(cursor, log, 104.0))
+        self.assertTrue(cursor.reconnected(119.0, 20))
+        self.assertEqual([], self.run_at(cursor, log, 119.0))
+        self.assertEqual([], self.run_at(cursor, log, 125.0))   # 25s old, but held
+        self.assertEqual([], self.run_at(cursor, log, 138.0))
+        self.assertIn("task.assignment_expired", self.run_at(cursor, log, 139.0))
+
+    def test_without_the_reconnect_signal_the_same_timing_expires(self):
+        cursor, log = self.start()
+        self.run_at(cursor, log, 104.0)
+        self.run_at(cursor, log, 119.0)
+        self.assertIn("task.assignment_expired", self.run_at(cursor, log, 125.0))
+
+    def test_a_stream_that_keeps_dropping_cannot_hold_expiry_forever(self):
+        cursor = OrderedProjectionCursor(PMState())
+        self.assertTrue(cursor.reconnected(100.0, 20))
+        self.assertEqual(120.0, cursor.lease_grace_until)
+        for now in (105.0, 119.0, 120.0, 139.9):   # in force, then cooling down
+            with self.subTest(now=now):
+                self.assertFalse(cursor.reconnected(now, 20))
+                self.assertEqual(120.0, cursor.lease_grace_until)
+        self.assertTrue(cursor.reconnected(140.0, 20))
+        self.assertEqual(160.0, cursor.lease_grace_until)
+        # A grace begun at start-up does not use up the reconnect's.
+        cursor = OrderedProjectionCursor(PMState())
+        cursor.begin_lease_grace(100.0, 20)
+        self.assertTrue(cursor.reconnected(112.0, 20))
+        self.assertEqual(132.0, cursor.lease_grace_until)
+        self.assertFalse(cursor.reconnected(118.0, 20))
+        # Flapping every 5 seconds from 100 to 300: expiry is possible half the time.
+        cursor = OrderedProjectionCursor(PMState())
+        open_seconds = 0
+        for now in range(100, 300, 5):
+            cursor.reconnected(float(now), 20)
+            open_seconds += 5 if now >= cursor.lease_grace_until else 0
+        self.assertGreaterEqual(open_seconds, 80)
+
     def test_observe_reports_only_gaps_longer_than_a_lease(self):
         cursor = OrderedProjectionCursor(PMState())
         self.assertIsNone(cursor.observe(100.0, 60))
@@ -216,6 +371,49 @@ class LeaseGraceTests(unittest.TestCase):
         self.assertEqual(61.0, cursor.observe(221.0, 60))
         self.assertEqual(281.0, cursor.lease_grace_until)
         self.assertIsNone(cursor.observe(200.0, 60))  # a clock stepping back is not a gap
+
+
+
+class SubscribeReconnectTests(unittest.TestCase):
+    def subscribe(self, streams, **options):
+        calls, attempts = [], iter(streams)
+
+        def stream_once(topics, from_id, on_idle, correlation_id, stop_event):
+            for step in next(attempts):
+                if step == "idle":
+                    on_idle()
+                elif step == "drop":
+                    raise httpx.ConnectError("bus went away")
+                else:
+                    yield {"id": step, "topic": "x", "payload": {}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = BusClient("http://127.0.0.1:8765", actor="pm", offset_dir=Path(directory))
+            with patch.object(client, "_stream_once", stream_once), \
+                    patch("logplane.client.time.sleep"), redirect_stdout(io.StringIO()):
+                events = client.subscribe(on_reconnect=lambda: calls.append("reconnect"),
+                                          **options)
+                for _ in range(sum(1 for stream in streams for step in stream
+                                   if isinstance(step, int))):
+                    calls.append(next(events)["id"])
+        return calls
+
+    def test_on_reconnect_runs_before_the_first_event_of_each_later_stream(self):
+        self.assertEqual([1, 2, "reconnect", 3, 4, "reconnect", 5],
+                         self.subscribe([[1, 2, "drop"], [3, 4, "drop"], [5]]))
+
+    def test_the_first_stream_is_not_a_reconnect(self):
+        self.assertEqual([1], self.subscribe([[1]]))
+
+    def test_on_reconnect_runs_before_a_keepalive_that_arrives_first(self):
+        calls = []
+        result = self.subscribe([[1, "drop"], ["idle", "idle", 2]],
+                                on_idle=lambda: calls.append("idle"))
+        self.assertEqual([1, "reconnect", 2], result)
+        self.assertEqual(["idle", "idle"], calls)
+
+    def test_an_empty_stream_followed_by_another_counts_once(self):
+        self.assertEqual([1, "reconnect", 2], self.subscribe([[1, "drop"], [], [2]]))
 
 
 if __name__ == "__main__":
