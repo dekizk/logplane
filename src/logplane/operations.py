@@ -12,6 +12,7 @@ from logplane.projection import (
     TASK_TERMINAL_STATUSES,
     CoordinationProjection,
     TaskRecord,
+    lease_allowance_exhausted,
     replay_events,
     retry_budget_exhausted,
 )
@@ -344,15 +345,15 @@ def explain_task(
             f"The last attempt failed permanently ({task.last_failure_code}); the PM has not yet recorded task.failed.",
             evidence,
         )
-    if (
-        task.last_failure_event_id is not None
-        and task.max_retries is not None
-        and task.retryable_failures > task.max_retries
-    ):
+    if task.last_failure_event_id is not None and retry_budget_exhausted(task):
         evidence.append(task.last_failure_event_id)
         return _explanation(
             "retry_exhaustion_reconciliation_pending",
-            "The automatic retry budget is exhausted and the PM has not yet recorded task.failed.",
+            (
+                "The task lost its worker more often than its lease policy allows"
+                if lease_allowance_exhausted(task)
+                else "The automatic retry budget is exhausted"
+            ) + " and the PM has not yet recorded task.failed.",
             evidence,
         )
 
@@ -644,6 +645,10 @@ def task_view(
             "max_retries": task.max_retries,
             "retryable_failures": task.retryable_failures,
             "remaining": retries_remaining(task),
+        },
+        "lease_policy": {
+            "max_expiries": task.max_lease_expiries,
+            "expiries": task.lease_expiries,
         },
         "deadline_at": task.deadline_at,
         "decision": {

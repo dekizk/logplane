@@ -635,6 +635,16 @@ def _task_created(event: _Event) -> None:
     _validate_capabilities(payload)
     _validate_json_object(payload, "context", max_bytes=MAX_INLINE_CONTEXT_BYTES)
     _validate_retry_policy(payload)
+    if "lease_policy" in payload:
+        lease_policy = payload["lease_policy"]
+        if (
+            not isinstance(lease_policy, dict)
+            or set(lease_policy) != {"max_expiries"}
+            or not _is_nonnegative_int(lease_policy["max_expiries"])
+        ):
+            raise EventValidationError(
+                "payload.lease_policy must contain only a non-negative integer max_expiries"
+            )
     _validate_task_dependencies(payload)
     _validate_task_scheduling(payload)
     _validate_external_origin(payload)

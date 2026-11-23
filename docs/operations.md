@@ -264,10 +264,30 @@ later process configuration change cannot alter replayed task behavior.
 Historical tasks that predate this field remain unlimited rather than being
 silently assigned a new policy.
 
-A lease expiry and a retryable `task.attempt_failed` each consume one retry.
-A permanent attempt failure does not spin: the PM immediately reconciles it
-to terminal `task.failed`. Blocking for a human decision does not consume the
-retry budget.
+A retryable `task.attempt_failed` consumes one retry. A permanent attempt
+failure does not spin: the PM immediately reconciles it to terminal
+`task.failed`. Blocking for a human decision does not consume the retry
+budget.
+
+Losing a worker is not the task's failure, so a lease expiry has its own
+allowance. Every new `task.created` records
+`payload.lease_policy.max_expiries`, materialized from
+`LOGPLANE_MAX_LEASE_EXPIRIES` (default `3`) when omitted: the task is
+reassigned after each lost worker until it has lost more than that many, and
+then ends `task.failed` with `lease_expiry_limit_exhausted`. A task that kills
+its worker every time therefore still stops. `logplane task` shows the count
+as "lost workers 1 of 3 allowed". Tasks created before this policy existed
+keep the old rule, where a lease expiry consumes a retry. `logplane retry`
+reopens a task that ran out of either allowance.
+
+The coordinator also avoids expiring leases it cannot judge. When it starts,
+or when it has not looked at the log for longer than a lease (a suspended
+laptop, a bus outage), old heartbeats mean it was not watching, not that
+workers died. It then waits one lease period for workers to be heard from
+before expiring any lease for silence alone; a worker whose process was
+replaced is still expired at once. A stall shorter than a lease gets no such
+grace, so a worker whose last heartbeat was already a few seconds old can
+still be expired after one.
 
 A retry normally starts as soon as a capable worker is free. A worker can
 instead ask for a wait, by reporting `retry_after_seconds` with a retryable

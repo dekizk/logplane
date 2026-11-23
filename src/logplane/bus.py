@@ -60,6 +60,22 @@ def _read_default_max_retries() -> int:
 
 DEFAULT_MAX_RETRIES = _read_default_max_retries()
 
+
+def _read_default_max_lease_expiries() -> int:
+    raw_value = os.environ.get("LOGPLANE_MAX_LEASE_EXPIRIES", "3")
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "LOGPLANE_MAX_LEASE_EXPIRIES must be a non-negative integer"
+        ) from exc
+    if value < 0:
+        raise RuntimeError("LOGPLANE_MAX_LEASE_EXPIRIES must be a non-negative integer")
+    return value
+
+
+DEFAULT_MAX_LEASE_EXPIRIES = _read_default_max_lease_expiries()
+
 # Refuse to start with pre-0.13 AGENT_BUS_* settings: an ignored
 # AGENT_BUS_TOKEN would otherwise leave the bus unauthenticated.
 check_legacy_environment()
@@ -641,6 +657,8 @@ def _assert_idempotent_match(
             # The server materializes its current default into new task events.
             # Omitting it remains the same logical request on a retry.
             stored_payload.pop("retry_policy", None)
+        if "lease_policy" not in payload:
+            stored_payload.pop("lease_policy", None)
         if "ownership" not in payload:
             # Controlled ownership is a server-materialized default.
             stored_payload.pop("ownership", None)
@@ -861,6 +879,13 @@ def append_event(
             payload.setdefault(
                 "retry_policy",
                 {"max_retries": DEFAULT_MAX_RETRIES},
+            )
+            # How many lost workers (lease expiries) the task survives, counted
+            # apart from its retries. Materialized like the retry policy, so a
+            # later configuration change cannot alter replayed behavior.
+            payload.setdefault(
+                "lease_policy",
+                {"max_expiries": DEFAULT_MAX_LEASE_EXPIRIES},
             )
             payload.setdefault(
                 "ownership",

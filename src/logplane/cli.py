@@ -1124,7 +1124,13 @@ def _format_task(value: dict) -> str:
             if value["not_before"] is not None
             else ""
         ),
-        f"Attempts: {value['attempt']} · retryable failures {retry['retryable_failures']} · retries remaining {remaining}",
+        f"Attempts: {value['attempt']} · retryable failures {retry['retryable_failures']} · retries remaining {remaining}"
+        + (
+            f" · lost workers {value['lease_policy']['expiries']} of "
+            f"{value['lease_policy']['max_expiries']} allowed"
+            if value.get("lease_policy", {}).get("max_expiries") is not None
+            else ""
+        ),
     ]
     if value["assignment_id"]:
         label = "Current owner" if value["assignment_active"] else "Last attempt"

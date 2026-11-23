@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Losing a worker no longer uses up a task's retries.** New tasks record a
+  lease policy (`lease_policy.max_expiries`, default 3 from
+  `LOGPLANE_MAX_LEASE_EXPIRIES`). A lease expiry counts against that allowance
+  instead of the retry budget, and a task that loses more workers than allowed
+  fails with `lease_expiry_limit_exhausted`. Tasks created earlier keep the old
+  rule, so existing histories replay unchanged. `logplane task` shows the
+  count.
+- **A coordinator that was not watching no longer expires live work.** At
+  start-up, and after it has not looked at the log for longer than a lease (a
+  suspended laptop, a bus outage), the coordinator waits one lease period for
+  workers to be heard from before expiring a lease for silence. Restarting
+  `logplane up` during a long task used to expire it, and with no retries fail
+  it; it now completes on the same attempt.
 - **A retryable failure can ask for a wait.** `RetryableFailure` gains an
   optional `retry_after_seconds`, carried as an optional field on
   `task.attempt_failed`; the coordinator does not reassign the task until that
