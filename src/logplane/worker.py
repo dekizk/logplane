@@ -15,7 +15,26 @@ from logplane.executors import (
 )
 
 BUS_URL = os.environ.get("LOGPLANE_URL", "http://127.0.0.1:8765")
-HEARTBEAT_SECONDS = float(os.environ.get("LOGPLANE_HEARTBEAT_SECONDS", "5"))
+HEARTBEAT_ENV = "LOGPLANE_HEARTBEAT_SECONDS"
+HEARTBEAT_SECONDS = float(os.environ.get(HEARTBEAT_ENV, "5"))
+
+
+def configured_heartbeat_seconds() -> float:
+    """The demo worker's heartbeat interval: LOGPLANE_HEARTBEAT_SECONDS, else 5.
+
+    Read when the worker starts, so `logplane demo-worker` and
+    `python -m logplane.worker` always agree.
+    """
+    raw = os.environ.get(HEARTBEAT_ENV)
+    if raw is None:
+        return 5.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not 0 < value < float("inf"):
+        raise ValueError(f"{HEARTBEAT_ENV} must be a positive number of seconds")
+    return value
 
 
 class DemoExecutor:
@@ -73,7 +92,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def run_demo_worker(args: argparse.Namespace, *, bus_url: str,
-                    heartbeat_seconds: float = 5.0) -> None:
+                    heartbeat_seconds: float | None = None) -> int:
+    """Run until stopped; return the process exit status (see exit_code)."""
+    if heartbeat_seconds is None:
+        heartbeat_seconds = configured_heartbeat_seconds()
     from logplane.client import BusClient
     from logplane.runtime import WorkerRuntime
 
@@ -94,12 +116,15 @@ def run_demo_worker(args: argparse.Namespace, *, bus_url: str,
         heartbeat_seconds=heartbeat_seconds,
     )
     runtime.run()
+    return runtime.exit_code
 
 
 def main() -> None:
     """Compatibility entry point: keep the environment-only launch supported."""
     check_legacy_environment()
-    run_demo_worker(parse_args(), bus_url=BUS_URL, heartbeat_seconds=HEARTBEAT_SECONDS)
+    status = run_demo_worker(parse_args(), bus_url=BUS_URL)
+    if status:
+        raise SystemExit(status)
 
 
 if __name__ == "__main__":

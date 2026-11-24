@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **A worker can give up on a bus that stays unreachable.** Off by default.
+  Set `LOGPLANE_WORKER_DISCONNECT_TIMEOUT_SECONDS` in the worker's
+  environment, or pass `disconnect_timeout_seconds` to `WorkerRuntime`, and a
+  worker whose heartbeats and lifecycle writes have failed for that long stops
+  accepting work, cancels what it is running, logs the assignments it could
+  not confirm, and stops. It does not mark tasks failed; the coordinator's
+  lease rules still decide that. The timeout must be at least twice the
+  heartbeat interval. See "Stopping a disconnected worker" in
+  `docs/operations.md`.
+- **Workers report why they stopped in their exit status.** `logplane
+  demo-worker`, `logplane adapter run` and the example workers used to exit 0
+  however they stopped. They now exit 75 when the worker stopped because it
+  could not reach the bus (the disconnect timeout, or an incoming assignment
+  it could not verify), 1 when it stopped itself over another failure (the
+  bus rejected a write, or an assignment could not be resolved safely), and 0
+  only when asked to stop, so a supervisor can restart on failure. A
+  heartbeat the bus refuses with a 4xx answer now stops the worker, as a
+  refused lifecycle write always has; it used to be logged and retried
+  forever.
+  `WorkerRuntime` gains `exit_code` and `stopped_by_disconnect`.
+- **`logplane demo-worker` now honours `LOGPLANE_HEARTBEAT_SECONDS`.** Only
+  `python -m logplane.worker` read it before; the command always used 5
+  seconds.
+- **Event streams filtered to quiet topics now get their keepalives.** The bus
+  restarted a stream's 15-second keepalive wait whenever anything was appended
+  to the log, so a subscriber filtered to topics with no traffic (a worker
+  waiting for assignments while heartbeats flow) was never sent one. Each
+  stream is now sent a keepalive after 15 seconds of being sent nothing.
+  `BusClient.subscribe` gains an optional `stream_timeout`, and its reconnect
+  delay now returns to one second when a keepalive arrives, not only when an
+  event does.
+
 - **Losing a worker no longer uses up a task's retries.** New tasks record a
   lease policy (`lease_policy.max_expiries`, default 3 from
   `LOGPLANE_MAX_LEASE_EXPIRIES`). A lease expiry counts against that allowance

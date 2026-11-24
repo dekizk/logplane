@@ -100,6 +100,10 @@ def main(argv=None):
         print(f"[{args.name}] stopped", flush=True)
     finally:
         executor.close()
+    # Non-zero only when the disconnect timeout stopped the worker, so a
+    # supervisor can restart it on failure.
+    if runtime.exit_code:
+        raise SystemExit(runtime.exit_code)
 
 
 if __name__ == "__main__":

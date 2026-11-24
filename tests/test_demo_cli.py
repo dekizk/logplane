@@ -1,6 +1,7 @@
 """CLI flags that make the demo worker and task submission scriptable."""
 
 import io
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -41,6 +42,7 @@ class DemoWorkerFlagTests(unittest.TestCase):
                     patch("logplane.client.BusClient"),
                     patch("logplane.runtime.WorkerRuntime") as runtime_class,
                 ):
+                    runtime_class.return_value.exit_code = 0
                     code, _, stderr = run(
                         ["demo-worker", "alice", "--config", str(config), "--delay", "2.5", *extra]
                     )
@@ -51,6 +53,53 @@ class DemoWorkerFlagTests(unittest.TestCase):
                 for name in ("block_once", "fail_once", "fail_permanently_once"):
                     self.assertEqual(expected.get(name), getattr(executor, name))
                 runtime_class.return_value.run.assert_called_once_with()
+
+    def test_a_disconnect_stop_becomes_the_command_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = initialize_local_config(directory)
+            with (
+                patch("logplane.client.BusClient"),
+                patch("logplane.runtime.WorkerRuntime") as runtime_class,
+            ):
+                runtime_class.return_value.exit_code = 75
+                code, _, stderr = run(["demo-worker", "alice", "--config", str(config)])
+        self.assertEqual(75, code, stderr)
+
+    def test_both_entry_points_use_the_configured_heartbeat_interval(self):
+        # LOGPLANE_HEARTBEAT_SECONDS is documented as the way to change the
+        # interval; the command used to ignore it and always pass 5 seconds.
+        def heartbeat_from(start, environment):
+            with (
+                patch.dict("os.environ", environment),
+                patch("logplane.client.BusClient"),
+                patch("logplane.runtime.WorkerRuntime") as runtime_class,
+            ):
+                runtime_class.return_value.exit_code = 0
+                start()
+            return runtime_class.call_args.kwargs["heartbeat_seconds"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = str(initialize_local_config(directory))
+
+            def command():
+                code, _, stderr = run(["demo-worker", "alice", "--config", config])
+                self.assertEqual(0, code, stderr)
+
+            def module():
+                with patch("sys.argv", ["worker", "alice"]):
+                    worker.main()
+
+            for start in (command, module):
+                with self.subTest(start=start.__name__):
+                    self.assertEqual(1.0, heartbeat_from(start, {"LOGPLANE_HEARTBEAT_SECONDS": "1"}))
+                    with patch.dict("os.environ"):
+                        os.environ.pop("LOGPLANE_HEARTBEAT_SECONDS", None)
+                        self.assertEqual(5.0, heartbeat_from(start, {}))
+
+            with patch.dict("os.environ", {"LOGPLANE_HEARTBEAT_SECONDS": "0"}):
+                code, _, stderr = run(["demo-worker", "alice", "--config", config])
+            self.assertEqual(2, code)
+            self.assertIn("LOGPLANE_HEARTBEAT_SECONDS must be a positive number", stderr)
 
     def test_default_delay_matches_previous_behaviour(self):
         self.assertEqual(0.5, worker.DemoExecutor("alice").delay_seconds)

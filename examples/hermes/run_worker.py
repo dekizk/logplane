@@ -125,6 +125,10 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         # A stop signal is the normal way to end a worker; leave a clean log.
         print("[hermes] stopped", flush=True)
+    # Non-zero only when the disconnect timeout stopped the worker, so a
+    # supervisor can restart it on failure.
+    if runtime.exit_code:
+        raise SystemExit(runtime.exit_code)
 
 
 if __name__ == "__main__":

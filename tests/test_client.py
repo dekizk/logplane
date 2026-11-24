@@ -1,8 +1,12 @@
+import contextlib
+import io
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import httpx
 
 from logplane.client import BusClient, BusProtocolError
 
@@ -87,6 +91,40 @@ class OffsetTests(unittest.TestCase):
             self.assertEqual(10, client.load_offset())
             self.assertEqual(Path(directory), client.offset_file.parent)
             self.assertNotIn("/", client.offset_file.name)
+
+    def test_a_keepalive_resets_the_reconnect_delay(self):
+        # Streams one and two fail without hearing from the bus, so the delay
+        # doubles. Stream three hears a keepalive before it fails: the bus is
+        # there, so the next reconnect starts from the short delay again.
+        waits = []
+        attempts = []
+
+        class Stop:
+            def is_set(self):
+                return len(waits) >= 4
+
+            def wait(self, seconds):
+                waits.append(seconds)
+                return len(waits) >= 4
+
+        def stream_once(topics, from_id, on_idle=None, *args, **kwargs):
+            attempts.append(from_id)
+            if len(attempts) == 3:
+                on_idle()
+            raise httpx.ReadTimeout("silent")
+            yield  # pragma: no cover - makes this a generator like the original
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = BusClient(
+                "http://127.0.0.1:8765", actor="worker", offset_dir=Path(directory)
+            )
+            with (
+                patch.object(client, "_stream_once", stream_once),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual([], list(client.subscribe(stop_event=Stop())))
+
+        self.assertEqual([1.0, 2.0, 1.0, 2.0], waits)
 
     def test_stream_keepalive_invokes_idle_reconciliation_callback(self):
         class FakeResponse:

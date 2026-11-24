@@ -1046,8 +1046,9 @@ new_event = asyncio.Condition()
 event_generation = 0
 
 # Open event streams wait for new events in short slices so they notice a
-# departed client or a server shutdown within about a second, while idle
-# keepalives keep their original 15-second cadence.
+# departed client or a server shutdown within about a second. A stream that
+# has been sent nothing for 15 seconds gets a keepalive, whatever else was
+# appended to the log in the meantime.
 STREAM_POLL_SECONDS = 1.0
 STREAM_KEEPALIVE_SECONDS = 15.0
 _shutting_down = False
@@ -1149,22 +1150,30 @@ async def stream(
     async def gen():
         last_id = from_id
         observed_generation = event_generation
+        # Keepalives are owed to this stream, not to the log: a subscriber
+        # filtered to quiet topics must still hear from the bus while other
+        # topics (every worker's heartbeat, for one) keep the log busy.
+        last_sent = time.monotonic()
         while True:
             if _stream_should_stop_now() or await request.is_disconnected():
                 return
+            if time.monotonic() - last_sent >= STREAM_KEEPALIVE_SECONDS:
+                last_sent = time.monotonic()
+                yield ": keepalive\n\n"
             events, scanned_to, full_window = await run_in_threadpool(
                 fetch_stream_window, last_id, topic_list, 500, correlation_id
             )
             last_id = scanned_to
             for event in events:
+                last_sent = time.monotonic()
                 yield f"id: {event['id']}\ndata: {json.dumps(event)}\n\n"
             if full_window:
                 continue
             # Wait for the next event without polling the database, checking
-            # for a departed client or shutdown each slice. After a full
-            # keepalive interval with no event, send a keepalive and re-check
-            # history, exactly as the single 15-second wait used to.
-            waited = 0.0
+            # for a departed client or shutdown each slice. Once this stream
+            # has gone a full keepalive interval without being sent anything,
+            # go round again: the top of the loop sends the keepalive and
+            # history is re-checked.
             while True:
                 if _stream_should_stop_now() or await request.is_disconnected():
                     return
@@ -1177,9 +1186,7 @@ async def stream(
                         observed_generation = event_generation
                     break
                 except asyncio.TimeoutError:
-                    waited += STREAM_POLL_SECONDS
-                    if waited >= STREAM_KEEPALIVE_SECONDS:
-                        yield ": keepalive\n\n"
+                    if time.monotonic() - last_sent >= STREAM_KEEPALIVE_SECONDS:
                         break
 
     return StreamingResponse(gen(), media_type="text/event-stream")
