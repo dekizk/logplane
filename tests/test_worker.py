@@ -56,7 +56,7 @@ class WorkerMainTests(unittest.TestCase):
             delay=0.5,
         )
         fake_bus = Mock()
-        fake_runtime = Mock()
+        fake_runtime = Mock(exit_code=0)
 
         with (
             patch("logplane.worker.parse_args", return_value=args),
@@ -73,6 +73,18 @@ class WorkerMainTests(unittest.TestCase):
         self.assertEqual(["python"], kwargs["capabilities"])
         self.assertIsInstance(kwargs["executor"], worker.DemoExecutor)
         fake_runtime.run.assert_called_once_with()
+
+    def test_main_exits_with_the_runtime_status_after_a_disconnect_stop(self):
+        args = SimpleNamespace(name="alice", capacity=1, capabilities=[], block=None,
+                               fail=None, fail_permanently=None, delay=0.5)
+        with (
+            patch("logplane.worker.parse_args", return_value=args),
+            patch("logplane.client.BusClient"),
+            patch("logplane.runtime.WorkerRuntime", return_value=Mock(exit_code=75)),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            worker.main()
+        self.assertEqual(75, stopped.exception.code)
 
     def test_entry_points_share_flags_and_validation(self):
         parsers = (worker.parse_args, lambda argv: cli.build_parser().parse_args(["demo-worker", *argv]))

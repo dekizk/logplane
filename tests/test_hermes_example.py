@@ -338,6 +338,7 @@ class HermesWorkerWiringTests(unittest.TestCase):
         executor = executor_class.return_value
         bus_client = client_class.return_value
         runtime = runtime_class.return_value
+        runtime.exit_code = 0
         with tempfile.TemporaryDirectory() as temp_dir:
             run_worker.main(
                 [
@@ -369,6 +370,19 @@ class HermesWorkerWiringTests(unittest.TestCase):
             heartbeat_seconds=5.0,
         )
         runtime.run.assert_called_once_with()
+
+    @patch("examples.hermes.run_worker.WorkerRuntime")
+    @patch("examples.hermes.run_worker.BusClient")
+    @patch("examples.hermes.run_worker.HermesExecutor")
+    def test_worker_exits_non_zero_after_a_disconnect_stop(
+        self, executor_class, client_class, runtime_class
+    ):
+        runtime_class.return_value.exit_code = 75
+        with tempfile.TemporaryDirectory() as temp_dir, self.assertRaises(SystemExit) as stopped:
+            run_worker.main(["--working-directory", temp_dir, "--model", "fake-model",
+                             "--provider", "fake-provider"])
+        self.assertEqual(75, stopped.exception.code)
+        runtime_class.return_value.run.assert_called_once_with()
 
 
 class HermesLiveSmokeTests(unittest.TestCase):

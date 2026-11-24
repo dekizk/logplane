@@ -298,6 +298,75 @@ a lease period. A suspension shorter than a lease with no reconnect
 gets no grace, so a worker whose last heartbeat was already a few seconds old
 can still be expired after one.
 
+**Stopping a disconnected worker.** The coordinator's lease is not a
+worker shutdown timer. By default a worker keeps running its assignment
+during a bus outage, subject to its existing deadline. If the executor
+finishes, the worker retries publishing the same outcome with the same key;
+it does not rerun the executor. A revocation observed on reconnect still
+takes precedence. Stopping `logplane up` stops its bus and coordinator, not
+workers started in other terminals.
+
+For an unattended worker, optionally set a separate disconnect timeout in
+the **worker's** environment. For example, to tolerate a 30-second outage
+but not retry publication indefinitely:
+
+```sh
+LOGPLANE_WORKER_DISCONNECT_TIMEOUT_SECONDS=120 logplane demo-worker alice
+```
+
+The same setting applies to `logplane adapter run` and workers built with
+`WorkerRuntime`; an explicit positive `disconnect_timeout_seconds` constructor
+argument overrides the environment. Unset means disabled. After registration,
+the first failed heartbeat or retryable lifecycle write starts the timer.
+Repeated failures do not extend it. A successful heartbeat or lifecycle write
+clears it; an idle event stream alone does not start it. Detection starts
+when a write reports failure, not at the instant the network goes down.
+A write the bus *refuses* (a 4xx answer, such as a bad token) is not an
+outage and does not use the timer: the worker stops at once, whether the
+refused write was a heartbeat or a lifecycle event, and with or without a
+timeout set.
+The timeout must be at least twice the worker's heartbeat interval (10
+seconds with the default 5-second heartbeat); a shorter value is refused at
+start-up, because the timer would run out before a retry was even sent. That
+minimum is a floor, not a safe setting. The timer runs until a write is
+*confirmed*, so a retry that succeeds but is answered slowly (a write may take
+up to 10 seconds to time out) can still arrive too late. Allow for the
+heartbeat interval, that 10 seconds, and the longest outage you want a running
+assignment to survive.
+
+On timeout the worker stops accepting assignments and retrying writes,
+requests cancellation of running executors, and logs unconfirmed assignment
+IDs and phases locally. It does **not** declare those tasks failed on the bus.
+In-flight writes may already have committed: check `logplane task` after
+recovery. Unpublished results are held in memory, not spooled to disk.
+Shutdown is cooperative: an in-process executor that ignores cancellation
+can keep the process alive; the standard stream reader may also take up to
+its 30-second idle read timeout to notice shutdown. Use retry-stable effect
+IDs for irreversible external operations.
+
+A worker stopped this way does not come back by itself, and that includes an
+idle worker with no assignment. So run an unattended worker under a
+supervisor that restarts it on failure (launchd `KeepAlive` with
+`SuccessfulExit` false, systemd `Restart=on-failure`, or a shell loop).
+`logplane demo-worker`, `logplane adapter run` and the example workers report
+why they stopped in their exit status:
+
+| Status | The worker stopped because |
+| --- | --- |
+| 0 | it was asked to: Ctrl-C, or a replacement instance with the same name registered |
+| 75 | it could not reach the bus: the disconnect timeout ran out, or it could not read the log to check an incoming assignment |
+| 1 | of another failure: the bus refused a heartbeat or lifecycle write (a 4xx answer), or an assignment could not be resolved safely |
+
+The second cause of 75 does not wait for the timeout and applies whether or
+not one is set: a worker that cannot verify an incoming assignment stops at
+once instead of running it (see
+[agent limits and workflow budgets](#agent-limits-and-workflow-budgets)).
+A restarted worker registers as a new instance; anything the old one left
+unconfirmed is expired by the coordinator and reassigned within the task's
+lost-worker allowance. Code that embeds `WorkerRuntime` reads
+`runtime.exit_code` (or `runtime.stopped_by_disconnect`) after `run()`
+returns.
+
 A retry normally starts as soon as a capable worker is free. A worker can
 instead ask for a wait, by reporting `retry_after_seconds` with a retryable
 failure: the task then stays `open` and is not reassigned until that long

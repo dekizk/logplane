@@ -352,12 +352,17 @@ class BusClient:
         correlation_id: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
         on_reconnect: Optional[Callable[[], None]] = None,
+        stream_timeout: Optional[float] = None,
     ) -> Iterator[dict]:
         """Follow SSE with reconnect, resuming after the last yielded event.
 
         on_idle runs on server keepalives. Coordinators can use it for
         time-based reconciliation without introducing a second state-mutating
         thread.
+
+        The delay before reconnecting doubles after each failed stream, up to
+        30 seconds, and returns to one second once the bus is heard from
+        again (an event or a keepalive).
 
         on_reconnect runs once for each stream after the first, just before
         that stream's first event is yielded or its first on_idle runs: the
@@ -381,13 +386,23 @@ class BusClient:
                 def idle(resumed=resumed, on_idle=on_idle) -> None:
                     resumed()
                     on_idle()
+
+            def heard(idle=idle) -> None:
+                # A keepalive proves the bus is there as well as an event
+                # does, so the next reconnect starts from the short delay.
+                nonlocal backoff
+                backoff = 1.0
+                if idle is not None:
+                    idle()
+
             try:
                 for event in self._stream_once(
                     topics,
                     last_id,
-                    idle,
+                    heard,
                     correlation_id,
                     stop_event,
+                    **({"stream_timeout": stream_timeout} if stream_timeout is not None else {}),
                 ):
                     resumed()
                     yielded = True
@@ -423,6 +438,7 @@ class BusClient:
         on_idle: Optional[Callable[[], None]] = None,
         correlation_id: Optional[str] = None,
         stop_event: Optional[threading.Event] = None,
+        stream_timeout: Optional[float] = None,
     ) -> Iterator[dict]:
         params: dict = {"from_id": from_id}
         if topics:
@@ -434,7 +450,7 @@ class BusClient:
             f"{self.base_url}/events/stream",
             params=params,
             headers=self._headers,
-            timeout=None,
+            timeout=stream_timeout,
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():

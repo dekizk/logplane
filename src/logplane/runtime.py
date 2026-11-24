@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import threading
 import time
 import uuid
@@ -27,6 +29,16 @@ from logplane.projection import PMState, PROJECTION_TOPICS, apply_event
 
 DEFAULT_HEARTBEAT_SECONDS = 5.0
 DEFAULT_PUBLISH_RETRY_SECONDS = 1.0
+DISCONNECT_TIMEOUT_ENV = "LOGPLANE_WORKER_DISCONNECT_TIMEOUT_SECONDS"
+# Exit statuses for worker entry points (see WorkerRuntime.exit_code). 75 is
+# sysexits EX_TEMPFAIL: the worker stopped because it could not reach the bus
+# and is safe to start again. 1 is any other failure that made it stop itself.
+DISCONNECT_EXIT_CODE = 75
+ERROR_EXIT_CODE = 1
+# Read timeout on the event stream when a disconnect timeout is set. The bus
+# sends every stream a keepalive after 15s of sending it nothing, so this much
+# silence means the connection is gone.
+STREAM_READ_TIMEOUT_SECONDS = 30.0
 DEFAULT_DEPENDENCY_FETCH_ATTEMPTS = 3
 RUNTIME_TOPICS = (
     "agent.registered",
@@ -53,6 +65,13 @@ _PHASE_EXECUTING = "executing"
 _PHASE_PUBLISHING_OUTCOME = "publishing_outcome"
 
 
+def _refusal_status(exc: Optional[BaseException]) -> Optional[int]:
+    """The 4xx status when the bus was reached and refused the request."""
+    if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500:
+        return exc.response.status_code
+    return None
+
+
 class WorkerRuntime:
     """Own bus plumbing while delegating actual work to an Executor.
 
@@ -73,6 +92,7 @@ class WorkerRuntime:
         heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
         publish_retry_seconds: float = DEFAULT_PUBLISH_RETRY_SECONDS,
         dependency_fetch_attempts: int = DEFAULT_DEPENDENCY_FETCH_ATTEMPTS,
+        disconnect_timeout_seconds: Optional[float] = None,
         unexpected_exceptions_retryable: bool = False,
         log: Callable[[str], None] = print,
     ):
@@ -103,6 +123,45 @@ class WorkerRuntime:
         self.heartbeat_seconds = heartbeat_seconds
         self.publish_retry_seconds = publish_retry_seconds
         self.dependency_fetch_attempts = dependency_fetch_attempts
+        timeout_setting = "disconnect_timeout_seconds"
+        if disconnect_timeout_seconds is None:
+            configured = os.environ.get(DISCONNECT_TIMEOUT_ENV)
+            if configured is not None:
+                timeout_setting = DISCONNECT_TIMEOUT_ENV
+                try:
+                    disconnect_timeout_seconds = float(configured)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{timeout_setting} must be a positive finite duration in seconds"
+                    ) from exc
+        if disconnect_timeout_seconds is not None:
+            if (
+                isinstance(disconnect_timeout_seconds, bool)
+                or not isinstance(disconnect_timeout_seconds, (int, float))
+                or not 0 < disconnect_timeout_seconds <= threading.TIMEOUT_MAX
+                or not math.isfinite(disconnect_timeout_seconds)
+            ):
+                raise ValueError(
+                    f"{timeout_setting} must be a positive finite duration in seconds"
+                )
+            # The timer starts at the first failed write and only a later
+            # confirmed write disarms it, so anything shorter than two
+            # heartbeat intervals stops the worker before a retry is even
+            # sent. This is a floor, not a guarantee: a retry that succeeds
+            # but is answered after the timer fires is still too late.
+            if disconnect_timeout_seconds < 2 * heartbeat_seconds:
+                raise ValueError(
+                    f"{timeout_setting} must be at least twice the heartbeat interval "
+                    f"({heartbeat_seconds:g}s)"
+                )
+        self.disconnect_timeout_seconds = disconnect_timeout_seconds
+        self._disconnect_timer: Optional[threading.Timer] = None
+        # True once this worker has stopped because it could not reach the
+        # bus: the disconnect timeout ran out, or a read it needs before it may
+        # run an assignment failed. run() returns as it does for any stop;
+        # callers read this, or exit_code, to tell the cases apart.
+        self.stopped_by_disconnect = False
+        self._failure_exit_code = 0
         self.unexpected_exceptions_retryable = unexpected_exceptions_retryable
         self.log = log
 
@@ -133,6 +192,27 @@ class WorkerRuntime:
     def active_count(self) -> int:
         with self._lock:
             return len(self._owned)
+
+    @property
+    def exit_code(self) -> int:
+        """Process exit status for a worker whose run() has returned.
+
+        0 when it was asked to stop (a signal, stop(), a replacement instance
+        registering, or a finished event iterable). DISCONNECT_EXIT_CODE when
+        it stopped because the bus could not be reached. ERROR_EXIT_CODE when
+        it stopped itself over anything else, such as the bus rejecting one of
+        its writes. A supervisor can therefore restart on failure only.
+        """
+        if self.stopped_by_disconnect:
+            return DISCONNECT_EXIT_CODE
+        return self._failure_exit_code
+
+    def _stopping_on_failure(self, exc: Optional[BaseException] = None) -> None:
+        """Record why the worker is about to stop itself, for exit_code."""
+        if isinstance(exc, httpx.HTTPError) and _refusal_status(exc) is None:
+            self.stopped_by_disconnect = True
+        else:
+            self._failure_exit_code = ERROR_EXIT_CODE
 
     def run(self, events: Optional[Iterable[dict]] = None) -> None:
         """Register and consume events until stopped.
@@ -173,10 +253,19 @@ class WorkerRuntime:
         try:
             stream = events
             if stream is None:
+                # A half-open SSE read must eventually notice stop_event. An
+                # SSE timeout only reconnects; it does not arm the disconnect
+                # timer, which counts failed writes.
+                options = (
+                    {"stream_timeout": STREAM_READ_TIMEOUT_SECONDS}
+                    if self.disconnect_timeout_seconds is not None and isinstance(self.bus, BusClient)
+                    else {}
+                )
                 stream = self.bus.subscribe(
                     topics=list(RUNTIME_TOPICS),
                     from_id=registered["id"],
                     stop_event=self.stop_event,
+                    **options,
                 )
             for event in stream:
                 if self.stop_event.is_set():
@@ -322,6 +411,7 @@ class WorkerRuntime:
             self.log(
                 f"[{self.name}] could not resolve assignment safely: {exc}; stopping"
             )
+            self._stopping_on_failure(exc)
             self.stop()
             return
 
@@ -532,8 +622,48 @@ class WorkerRuntime:
             self._close_executor()
         self.stop_event.set()
         self._heartbeat_stop.set()
+        self._write_confirmed()
         if self._heartbeat is not None:
             self._heartbeat.join(timeout=max(1.0, self.heartbeat_seconds + 0.5))
+
+    def _write_failed(self) -> None:
+        """Arm once per outage. Further failures never extend the window."""
+        timeout = self.disconnect_timeout_seconds
+        if timeout is None:
+            return
+        with self._lock:
+            if self._heartbeat_stop.is_set() or self._disconnect_timer is not None:
+                return
+            timer = threading.Timer(timeout, lambda: self._disconnect_elapsed(timer))
+            timer.daemon = True
+            self._disconnect_timer = timer
+            timer.start()
+
+    def _write_confirmed(self) -> None:
+        if self.disconnect_timeout_seconds is not None:
+            with self._lock:
+                timer, self._disconnect_timer = self._disconnect_timer, None
+                if timer is not None:
+                    timer.cancel()
+
+    def _disconnect_elapsed(self, timer: threading.Timer) -> None:
+        with self._lock:
+            # A successful write may already have disarmed this callback.
+            if self._disconnect_timer is not timer or self.stop_event.is_set():
+                return
+            self._disconnect_timer = None
+            self.stopped_by_disconnect = True
+            self._accepting = False
+            self.stop_event.set()
+            self._heartbeat_stop.set()
+            phases = dict(self._assignment_phases)
+        self.log(
+            f"[{self.name}] disconnect timeout ({self.disconnect_timeout_seconds:g}s); "
+            f"stopping locally; unconfirmed assignments (id: phase): {phases}. "
+            "Check bus history after recovery."
+        )
+        for assignment_id in phases:
+            self._revoke(assignment_id)
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_seconds):
@@ -542,7 +672,22 @@ class WorkerRuntime:
                     "agent.heartbeat",
                     {"name": self.name, "instance_id": self.instance_id},
                 )
+                self._write_confirmed()
             except httpx.HTTPError as exc:
+                refused = _refusal_status(exc)
+                if refused is not None:
+                    # The bus answered and said no (a bad token, say). That is
+                    # not an outage to wait out: stop, as for a refused
+                    # lifecycle write, so this worker neither keeps running
+                    # work it cannot report nor idles while looking alive.
+                    self.log(
+                        f"[{self.name}] bus rejected agent.heartbeat with "
+                        f"HTTP {refused}; stopping this instance"
+                    )
+                    self._stopping_on_failure(exc)
+                    self.stop()
+                    return
+                self._write_failed()
                 self.log(
                     f"[{self.name}] heartbeat failed ({exc.__class__.__name__})"
                 )
@@ -672,20 +817,24 @@ class WorkerRuntime:
     ) -> Optional[dict]:
         while self._owns(assignment_id) and not self.stop_event.is_set():
             try:
-                return self.bus.publish(
+                sent = self.bus.publish(
                     topic,
                     payload,
                     caused_by=caused_by,
                     idempotency_key=idempotency_key,
                 )
+                self._write_confirmed()
+                return sent
             except httpx.HTTPStatusError as exc:
                 if 400 <= exc.response.status_code < 500:
                     self.log(
                         f"[{self.name}] bus rejected {topic} with "
                         f"HTTP {exc.response.status_code}; stopping this instance"
                     )
+                    self._stopping_on_failure(exc)
                     self.stop_event.set()
                     return None
+                self._write_failed()
                 self.log(
                     f"[{self.name}] publish failed ({exc.__class__.__name__}); "
                     f"retrying {topic}"
@@ -693,6 +842,7 @@ class WorkerRuntime:
                 if self.stop_event.wait(self.publish_retry_seconds):
                     break
             except httpx.HTTPError as exc:
+                self._write_failed()
                 self.log(
                     f"[{self.name}] publish failed ({exc.__class__.__name__}); "
                     f"retrying {topic}"
@@ -717,7 +867,8 @@ class WorkerRuntime:
         expired = False
         with self._lock:
             if (
-                assignment_id not in self._owned
+                self.stop_event.is_set()
+                or assignment_id not in self._owned
                 or self._assignment_phases.get(assignment_id) != expected
             ):
                 return False

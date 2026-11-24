@@ -390,7 +390,7 @@ def _worker_main(argv: list[str]) -> int:
         runtime.run()
     except KeyboardInterrupt:
         runtime.stop()
-    return 0
+    return runtime.exit_code
 
 
 # --------------------------------------------------------------------------

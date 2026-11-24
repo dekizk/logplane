@@ -749,8 +749,7 @@ def _run_local_command(
     if args.command == "demo-worker":
         from logplane.worker import run_demo_worker
 
-        run_demo_worker(args, bus_url=local.bus_url)
-        return 0
+        return run_demo_worker(args, bus_url=local.bus_url)
     if args.command == "submit":
         from logplane.client import BusClient
 
@@ -906,7 +905,7 @@ def _run_local_command(
             capabilities=integration.capabilities,
         )
         runtime.run()
-        return 0
+        return runtime.exit_code
     print("logplane: unsupported command", file=stderr)
     return 2
 

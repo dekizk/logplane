@@ -125,4 +125,4 @@ def run_python_worker(argv: list[str], name: str, capability: str,
         runtime.run()
     except KeyboardInterrupt:
         print(f"[{args.name}] stopped", flush=True)
-    return 0
+    return runtime.exit_code
