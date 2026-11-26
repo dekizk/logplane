@@ -692,6 +692,9 @@ def _agent_presence(event: _Event) -> None:
             isinstance(item, str) and item.strip() for item in capabilities
         ):
             raise EventValidationError("payload.capabilities must be a list of strings")
+    if event.topic == "agent.stopped":
+        if not isinstance(payload.get("requested", False), bool):
+            raise EventValidationError("payload.requested must be a boolean")
 
 
 def _agent_policy_set(event: _Event) -> None:
@@ -968,6 +971,8 @@ def _attempt_failed(event: _Event) -> None:
 def _assignment_expired(event: _Event) -> None:
     for field in ("assignment_id", "assignee", "worker_instance_id", "reason"):
         _require_string(event.payload, field)
+    if not isinstance(event.payload.get("released", False), bool):
+        raise EventValidationError("payload.released must be a boolean")
 
 
 def _decision_needed(event: _Event) -> None:
@@ -1120,6 +1125,7 @@ _PAYLOAD_VALIDATORS: dict[str, Validator] = {
     "integration.task_observed": _task_observed,
     "agent.registered": _agent_presence,
     "agent.heartbeat": _agent_presence,
+    "agent.stopped": _agent_presence,
     "agent.policy_set": _agent_policy_set,
     "workflow.pause_requested": _workflow_control_requested,
     "workflow.resume_requested": _workflow_control_requested,

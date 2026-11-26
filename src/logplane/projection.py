@@ -39,6 +39,12 @@ class WorkerRecord:
     capabilities: frozenset[str] = field(default_factory=frozenset)
     last_event_id: int = 0
     registered_event_id: int = 0
+    # Set by agent.stopped: this process announced that it has stopped. It
+    # holds no lease from then on, however recent its last heartbeat was.
+    stopped_event_id: Optional[int] = None
+    # True when it was asked to stop; False when it stopped itself over a
+    # failure. Decides whether the work it held counts as a lost worker.
+    stop_requested: bool = False
 
 
 @dataclass
@@ -231,7 +237,8 @@ class PMState:
         return [
             worker
             for worker in self.workers.values()
-            if now - worker.last_seen <= lease_seconds
+            if worker.stopped_event_id is None
+            and now - worker.last_seen <= lease_seconds
         ]
 
     def worker_load(self, worker: WorkerRecord) -> int:
@@ -700,9 +707,41 @@ def _apply_agent_heartbeat(
         or ev.get("actor") != name
         or instance_id != worker.instance_id
         or event_id <= worker.last_event_id
+        # A stopped process stays stopped; only a new registration, which is
+        # a new process instance, brings the name back.
+        or worker.stopped_event_id is not None
     ):
         return False
     worker.last_seen = max(worker.last_seen, float(timestamp))
+    worker.last_event_id = event_id
+    return True
+
+
+def _apply_agent_stopped(
+    state: PMState,
+    ev: dict,
+    payload: dict,
+    event_id: int,
+    timestamp: float,
+) -> bool:
+    """The named process says it has stopped: its lease ends here.
+
+    Only the currently registered instance can stop itself. A stop from a
+    process that has since been replaced says nothing about its successor.
+    """
+    name = payload.get("name")
+    instance_id = payload.get("instance_id")
+    worker = state.workers.get(name) if isinstance(name, str) else None
+    if (
+        worker is None
+        or ev.get("actor") != name
+        or instance_id != worker.instance_id
+        or event_id <= worker.last_event_id
+        or worker.stopped_event_id is not None
+    ):
+        return False
+    worker.stopped_event_id = event_id
+    worker.stop_requested = payload.get("requested") is True
     worker.last_event_id = event_id
     return True
 
@@ -1602,7 +1641,11 @@ def _apply_task_assignment_expired(
     task.last_failure_event_id = event_id
     task.last_failure_code = "assignment_expired"
     task.last_failure_reason = payload.get("reason")
-    if task.max_lease_expiries is None:
+    if payload.get("released") is True:
+        # Handed back by a worker that stopped in an orderly way. Nothing
+        # went wrong with the task, so no allowance is charged for it.
+        pass
+    elif task.max_lease_expiries is None:
         task.retryable_failures += 1
     else:
         task.lease_expiries += 1
@@ -2133,6 +2176,7 @@ TaskHandler = Callable[[PMState, dict, dict, int, float, int, TaskRecord], bool]
 _AGENT_AND_USAGE_HANDLERS: dict[str, AgentHandler] = {
     "agent.registered": _apply_agent_registered,
     "agent.heartbeat": _apply_agent_heartbeat,
+    "agent.stopped": _apply_agent_stopped,
     "agent.policy_set": _apply_agent_policy_set,
     "workflow.usage_recorded": _apply_workflow_usage_recorded,
 }

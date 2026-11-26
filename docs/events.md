@@ -77,6 +77,16 @@ earlier releases still replays:
   non-negative integer `max_expiries`, materialized by the server when
   omitted. Tasks without it keep the earlier rule that a lease expiry consumes
   a retry.
+- `agent.stopped` and the optional boolean `payload.released` on
+  `task.assignment_expired` (after v0.14.1). `agent.stopped` carries `name`,
+  `instance_id` and an optional boolean `requested` (false when omitted): a
+  worker publishes it after an orderly stop, and only the currently
+  registered instance of a name can stop itself. The PM then expires that
+  instance's attempts without waiting for the lease, with `released: true`
+  when the stop was requested or the attempt had not started. A released
+  expiry is not charged to the task's lease policy or retry budget. Histories
+  without either replay unchanged, and a PM that predates them ignores
+  `agent.stopped` and falls back to the lease.
 - The optional `payload.retry_after_seconds` on a retryable
   `task.attempt_failed` (after v0.14.1): a positive number of at most 604,800
   that delays the next assignment until that long after the event. Failures
@@ -93,13 +103,14 @@ Core v2 topics:
 |---|---|---|
 | `agent.registered` | worker | Announces a process instance, capabilities, and capacity |
 | `agent.heartbeat` | worker | Renews that process instance's lease |
+| `agent.stopped` | worker | Says that process instance has stopped, ending its lease at once |
 | `task.created` | human/agent | Requests a logical outcome with immutable dependency and scheduling policy |
 | `task.assigned` | PM | Creates a numbered execution attempt with decisions and completion references |
 | `task.started` | worker | Confirms the active attempt began |
 | `task.completed` | worker | Completes the active attempt and logical task |
 | `task.blocked` | worker | Pauses the attempt for human input |
 | `task.attempt_failed` | worker | Records a retryable or permanent execution failure |
-| `task.assignment_expired` | PM | Records loss or replacement of the assigned worker |
+| `task.assignment_expired` | PM | Records loss, replacement or stop of the assigned worker |
 | `task.failed` | PM | Terminates a task after policy exhaustion or permanent failure |
 | `task.dependency_failed` | PM | Terminates downstream work whose prerequisite failed |
 | `task.retry_requested` | human/agent | Extends policy and reopens the latest failed task when its intent has not been superseded |

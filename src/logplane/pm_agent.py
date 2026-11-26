@@ -455,10 +455,18 @@ def plan_next_emission(
         if task.status not in ACTIVE_TASK_STATUSES or task.assignment_id is None:
             continue
         worker = state.workers.get(task.assignee or "")
+        released = False
         if worker is None:
             reason = "worker is no longer registered"
         elif worker.instance_id != task.worker_instance_id:
             reason = "worker process was replaced"
+        elif worker.stopped_event_id is not None:
+            # The worker said so itself, so there is nothing to wait for and
+            # no outage to allow for: hold_lease_expiry does not apply.
+            reason = "worker stopped"
+            # Not charged to the task when the worker was asked to stop, or
+            # when the attempt never started and so cannot be why it stopped.
+            released = worker.stop_requested or task.status == "assigned"
         elif now - worker.last_seen > lease_seconds:
             if hold_lease_expiry:
                 continue
@@ -473,6 +481,7 @@ def plan_next_emission(
                 "assignee": task.assignee,
                 "worker_instance_id": task.worker_instance_id,
                 "reason": reason,
+                **({"released": True} if released else {}),
             },
             "caused_by": task.assignment_event_id,
             "idempotency_key": f"expire:{task.assignment_id}",

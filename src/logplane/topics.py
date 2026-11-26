@@ -4,6 +4,7 @@ COORDINATION_TOPICS = frozenset(
     {
         "agent.registered",
         "agent.heartbeat",
+        "agent.stopped",
         "agent.policy_set",
         "task.created",
         "task.assigned",

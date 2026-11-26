@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import signal
 import threading
 import time
 import uuid
@@ -196,6 +197,8 @@ class WorkerRuntime:
         self._attempt_timers: dict[str, threading.Timer] = {}
         self._timed_out: set[str] = set()
         self._abandoned: set[str] = set()
+        self._registered = False
+        self._stop_announced = False
         self._paused_task_ids: set[int] = set()
         self._paused_correlations: set[str] = set()
         # Admission is derived from the same ordered history as the PM. This
@@ -234,6 +237,69 @@ class WorkerRuntime:
         else:
             self._failure_exit_code = ERROR_EXIT_CODE
 
+    def _announce_stop(self) -> None:
+        """Tell the coordinator this process has stopped. Best effort, once.
+
+        Without it the coordinator learns only when the lease runs out: until
+        then it may hand this worker new work, and the work it held waits and
+        is counted as a lost worker. With it, that work is handed back at
+        once, and free of charge when the stop was requested.
+        """
+        with self._lock:
+            if (
+                self._stop_announced
+                or not self._registered
+                # The bus could not be reached: do not wait on it again.
+                or self.stopped_by_disconnect
+            ):
+                return
+            self._stop_announced = True
+        try:
+            self.bus.publish(
+                "agent.stopped",
+                {
+                    "name": self.name,
+                    "instance_id": self.instance_id,
+                    "requested": self.exit_code == 0,
+                },
+                idempotency_key=f"stopped:{self.instance_id}",
+            )
+        except Exception as exc:
+            self.log(
+                f"[{self.name}] could not announce the stop ({exc.__class__.__name__}); "
+                "the coordinator will notice when the lease expires"
+            )
+
+    def _stop_on_sigterm(self):
+        """Treat SIGTERM like Ctrl-C while run() is in charge of the process.
+
+        A supervisor stops a worker with SIGTERM, which by default ends
+        Python at once: no cancellation of running agents, no announcement.
+        Only done from the main thread and only when nobody else has
+        installed a handler. Returns a callable that undoes it.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return lambda: None
+        try:
+            if signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+                return lambda: None
+
+            def interrupt(signum, frame):
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, interrupt)
+        except (ValueError, OSError):
+            return lambda: None
+
+        def restore() -> None:
+            try:
+                if signal.getsignal(signal.SIGTERM) is interrupt:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+
+        return restore
+
     def run(self, events: Optional[Iterable[dict]] = None) -> None:
         """Register and consume events until stopped.
 
@@ -258,6 +324,7 @@ class WorkerRuntime:
         )
         with self._lock:
             self._accepting = True
+            self._registered = True
         self._pool = ThreadPoolExecutor(
             max_workers=self.capacity,
             thread_name_prefix=f"{self.name}-assignment",
@@ -269,6 +336,7 @@ class WorkerRuntime:
         )
         self._heartbeat.start()
 
+        restore_sigterm = self._stop_on_sigterm()
         completed_normally = False
         try:
             stream = events
@@ -297,7 +365,10 @@ class WorkerRuntime:
                     break
             completed_normally = not self.stop_event.is_set()
         finally:
-            self.shutdown(drain=completed_normally)
+            try:
+                self.shutdown(drain=completed_normally)
+            finally:
+                restore_sigterm()
 
     def process_event(self, event: dict) -> None:
         if not isinstance(event, dict):
@@ -313,6 +384,10 @@ class WorkerRuntime:
                 and payload.get("instance_id") != self.instance_id
             ):
                 self.log(f"[{self.name}] replacement instance registered; stopping")
+                # The coordinator already knows: the new registration took
+                # over the name, and a stop from this one would be ignored.
+                with self._lock:
+                    self._stop_announced = True
                 self.stop()
             return
 
@@ -645,6 +720,13 @@ class WorkerRuntime:
         self._write_confirmed()
         if self._heartbeat is not None:
             self._heartbeat.join(timeout=max(1.0, self.heartbeat_seconds + 0.5))
+        # Last, once every executor has returned: the coordinator may hand the
+        # work to another worker the moment it hears this. Not after a finite
+        # event iterable has simply run out (embedding and tests): everything
+        # accepted was finished, so there is nothing to hand back. A failure
+        # while draining is still a stop.
+        if not drain or self.exit_code != 0:
+            self._announce_stop()
 
     def _write_failed(self) -> None:
         """Arm once per outage. Further failures never extend the window."""
@@ -935,6 +1017,9 @@ class WorkerRuntime:
             self._abandoned.discard(assignment_id)
         self._stopping_on_failure()
         self.stop()
+        # shutdown() cannot get as far as announcing while that executor is
+        # stuck, so say so now, or the retry may come straight back here.
+        self._announce_stop()
 
     def _publish_while_owned(
         self,

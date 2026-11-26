@@ -282,6 +282,20 @@ reopens a task that ran out of either allowance, and its
 `--additional-retries N` then allows exactly N further assignments in total,
 whether each ends in a failure or a lost worker.
 
+Stopping a worker on purpose is not losing one. A worker stopped with Ctrl-C
+or `SIGTERM` cancels its running attempts, waits for its executors to return,
+and then publishes `agent.stopped`. The coordinator hands the work back the
+moment it reads that, without waiting for the lease to run out, and does not
+count it: the next attempt can start on another worker within a second, and
+"lost workers" and the retry budget are untouched. `logplane workers` shows
+the worker as `stopped`, and it is given no new work until a new process
+registers under the name. A worker that stops itself over a failure (see the
+exit statuses below) announces the stop in the same way, so its work is also
+handed back at once, but an attempt it had already started counts as a lost
+worker; one it had not started never does. If the announcement cannot be
+delivered, or the worker is killed outright (`SIGKILL`, a crash, a power
+cut), nothing is announced and the lease rules above apply as before.
+
 The coordinator also avoids expiring leases it cannot judge. Old heartbeats
 mean it was not watching, not that workers died, in three cases: when it
 starts, when its event stream reconnects after any break, and when it has not
