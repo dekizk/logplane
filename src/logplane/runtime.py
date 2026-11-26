@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Union
 
 import httpx
 
@@ -39,6 +39,10 @@ ERROR_EXIT_CODE = 1
 # sends every stream a keepalive after 15s of sending it nothing, so this much
 # silence means the connection is gone.
 STREAM_READ_TIMEOUT_SECONDS = 30.0
+# How long an executor has to return after an attempt timeout asked it to
+# cancel. Past this the worker reports the timeout itself and stops, because
+# the slot that executor still occupies cannot be reclaimed.
+ATTEMPT_CANCEL_GRACE_SECONDS = 10.0
 DEFAULT_DEPENDENCY_FETCH_ATTEMPTS = 3
 RUNTIME_TOPICS = (
     "agent.registered",
@@ -93,6 +97,7 @@ class WorkerRuntime:
         publish_retry_seconds: float = DEFAULT_PUBLISH_RETRY_SECONDS,
         dependency_fetch_attempts: int = DEFAULT_DEPENDENCY_FETCH_ATTEMPTS,
         disconnect_timeout_seconds: Optional[float] = None,
+        attempt_timeout_seconds: Optional[float] = None,
         unexpected_exceptions_retryable: bool = False,
         log: Callable[[str], None] = print,
     ):
@@ -155,6 +160,18 @@ class WorkerRuntime:
                     f"({heartbeat_seconds:g}s)"
                 )
         self.disconnect_timeout_seconds = disconnect_timeout_seconds
+        if attempt_timeout_seconds is not None and (
+            isinstance(attempt_timeout_seconds, bool)
+            or not isinstance(attempt_timeout_seconds, (int, float))
+            or not 0 < attempt_timeout_seconds <= threading.TIMEOUT_MAX
+            or not math.isfinite(attempt_timeout_seconds)
+        ):
+            raise ValueError(
+                "attempt_timeout_seconds must be a positive finite duration in seconds"
+            )
+        # Wall-clock limit on one execution of the executor, for executors
+        # that have no limit of their own. None leaves attempts unbounded.
+        self.attempt_timeout_seconds = attempt_timeout_seconds
         self._disconnect_timer: Optional[threading.Timer] = None
         # True once this worker has stopped because it could not reach the
         # bus: the disconnect timeout ran out, or a read it needs before it may
@@ -176,6 +193,9 @@ class WorkerRuntime:
         self._task_by_assignment: dict[str, int] = {}
         self._correlation_by_assignment: dict[str, str] = {}
         self._deadline_timers: dict[str, threading.Timer] = {}
+        self._attempt_timers: dict[str, threading.Timer] = {}
+        self._timed_out: set[str] = set()
+        self._abandoned: set[str] = set()
         self._paused_task_ids: set[int] = set()
         self._paused_correlations: set[str] = set()
         # Admission is derived from the same ordered history as the PM. This
@@ -731,6 +751,7 @@ class WorkerRuntime:
                     f"[{self.name}] executing task {assignment.task_id} "
                     f"attempt {assignment.attempt}: {assignment.goal}"
                 )
+                self._arm_attempt_timeout(assignment, lifecycle)
                 try:
                     outcome = ensure_outcome(self.executor.execute(assignment))
                 except Exception as exc:
@@ -746,6 +767,14 @@ class WorkerRuntime:
                     check_deadline=False,
                 ):
                     return
+                # Read only now: the timer marks an attempt timed out while it
+                # is still executing, which the transition above has ended.
+                with self._lock:
+                    timed_out = assignment_id in self._timed_out
+                if timed_out:
+                    # Once the limit has passed the attempt is a timeout,
+                    # whatever the cancelled executor handed back.
+                    outcome = self._attempt_timeout_outcome()
 
             if isinstance(outcome, Completed):
                 if json_size(outcome.result) > MAX_INLINE_RESULT_BYTES:
@@ -776,35 +805,136 @@ class WorkerRuntime:
                 )
                 return
 
-            retryable = isinstance(outcome, RetryableFailure)
-            self._publish_while_owned(
-                assignment_id,
-                "task.attempt_failed",
-                {
-                    **lifecycle,
-                    "failure_code": outcome.code,
-                    "reason": outcome.reason,
-                    "retryable": retryable,
-                    **(
-                        {"retry_after_seconds": outcome.retry_after_seconds}
-                        if retryable and outcome.retry_after_seconds is not None
-                        else {}
-                    ),
-                },
-                caused_by=assignment.assignment_event_id,
-                idempotency_key=f"attempt-failed:{assignment_id}",
-            )
+            self._publish_attempt_failed(assignment, lifecycle, outcome)
         finally:
-            deadline_timer = None
             with self._lock:
-                self._owned.discard(assignment_id)
-                self._assignment_phases.pop(assignment_id, None)
-                self._futures.pop(assignment_id, None)
-                self._task_by_assignment.pop(assignment_id, None)
-                self._correlation_by_assignment.pop(assignment_id, None)
-                deadline_timer = self._deadline_timers.pop(assignment_id, None)
-            if deadline_timer is not None:
-                deadline_timer.cancel()
+                abandoned = assignment_id in self._abandoned
+            # An abandoned attempt is being reported by _attempt_abandoned,
+            # which still needs the ownership record this would remove.
+            if not abandoned:
+                self._forget_assignment(assignment_id)
+
+    def _publish_attempt_failed(
+        self,
+        assignment: AssignmentContext,
+        lifecycle: dict,
+        outcome: Union[RetryableFailure, PermanentFailure],
+    ) -> None:
+        retryable = isinstance(outcome, RetryableFailure)
+        self._publish_while_owned(
+            assignment.assignment_id,
+            "task.attempt_failed",
+            {
+                **lifecycle,
+                "failure_code": outcome.code,
+                "reason": outcome.reason,
+                "retryable": retryable,
+                **(
+                    {"retry_after_seconds": outcome.retry_after_seconds}
+                    if isinstance(outcome, RetryableFailure)
+                    and outcome.retry_after_seconds is not None
+                    else {}
+                ),
+            },
+            caused_by=assignment.assignment_event_id,
+            idempotency_key=f"attempt-failed:{assignment.assignment_id}",
+        )
+
+    def _forget_assignment(self, assignment_id: str) -> None:
+        """Drop every record of an assignment this worker is finished with."""
+        with self._lock:
+            self._owned.discard(assignment_id)
+            self._assignment_phases.pop(assignment_id, None)
+            self._futures.pop(assignment_id, None)
+            self._task_by_assignment.pop(assignment_id, None)
+            self._correlation_by_assignment.pop(assignment_id, None)
+            self._timed_out.discard(assignment_id)
+            timers = (
+                self._deadline_timers.pop(assignment_id, None),
+                self._attempt_timers.pop(assignment_id, None),
+            )
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
+
+    def _attempt_timeout_outcome(self) -> RetryableFailure:
+        return RetryableFailure(
+            "attempt_timeout",
+            f"attempt ran longer than this worker's "
+            f"{self.attempt_timeout_seconds:g}-second limit",
+        )
+
+    def _arm_attempt_timeout(self, assignment: AssignmentContext, lifecycle: dict) -> None:
+        if self.attempt_timeout_seconds is None:
+            return
+        timer = threading.Timer(
+            self.attempt_timeout_seconds,
+            self._attempt_timeout_elapsed,
+            args=(assignment, lifecycle),
+        )
+        timer.daemon = True
+        with self._lock:
+            if assignment.assignment_id not in self._owned:
+                return
+            self._attempt_timers[assignment.assignment_id] = timer
+        timer.start()
+
+    def _attempt_timeout_elapsed(self, assignment: AssignmentContext, lifecycle: dict) -> None:
+        """The limit has passed: cancel the executor and give it a grace period."""
+        assignment_id = assignment.assignment_id
+        grace = threading.Timer(
+            ATTEMPT_CANCEL_GRACE_SECONDS,
+            self._attempt_abandoned,
+            args=(assignment, lifecycle),
+        )
+        grace.daemon = True
+        with self._lock:
+            if (
+                self.stop_event.is_set()
+                or assignment_id not in self._owned
+                or self._assignment_phases.get(assignment_id) != _PHASE_EXECUTING
+            ):
+                return
+            self._timed_out.add(assignment_id)
+            self._attempt_timers[assignment_id] = grace
+        self.log(
+            f"[{self.name}] attempt timeout ({self.attempt_timeout_seconds:g}s) "
+            f"reached: {assignment_id}; cancelling"
+        )
+        # Started first: a cancel() that blocks must not postpone the grace.
+        grace.start()
+        self._cancel_executor(assignment_id)
+
+    def _attempt_abandoned(self, assignment: AssignmentContext, lifecycle: dict) -> None:
+        """The executor ignored cancellation: report for it, then stop.
+
+        Its thread is still inside execute(), so the slot cannot be reused. A
+        worker that kept heartbeating would be handed assignments it could
+        never start, so it stops and lets its lease lapse instead.
+        """
+        assignment_id = assignment.assignment_id
+        with self._lock:
+            if (
+                self.stop_event.is_set()
+                or assignment_id not in self._owned
+                or self._assignment_phases.get(assignment_id) != _PHASE_EXECUTING
+            ):
+                return
+            # From here the executor's eventual return is discarded.
+            self._assignment_phases[assignment_id] = _PHASE_PUBLISHING_OUTCOME
+            self._abandoned.add(assignment_id)
+        self.log(
+            f"[{self.name}] executor did not stop within "
+            f"{ATTEMPT_CANCEL_GRACE_SECONDS:g}s of cancellation: {assignment_id}; "
+            "reporting the timeout and stopping this worker, because the slot "
+            "it occupies cannot be reclaimed"
+        )
+        self._publish_attempt_failed(assignment, lifecycle, self._attempt_timeout_outcome())
+        self._forget_assignment(assignment_id)
+        with self._lock:
+            self._abandoned.discard(assignment_id)
+        self._stopping_on_failure()
+        self.stop()
 
     def _publish_while_owned(
         self,
@@ -900,9 +1030,13 @@ class WorkerRuntime:
             self._correlation_by_assignment.pop(assignment_id, None)
             phase = self._assignment_phases.pop(assignment_id, None)
             future = self._futures.get(assignment_id)
-            deadline_timer = self._deadline_timers.pop(assignment_id, None)
-        if deadline_timer is not None:
-            deadline_timer.cancel()
+            timers = (
+                self._deadline_timers.pop(assignment_id, None),
+                self._attempt_timers.pop(assignment_id, None),
+            )
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
         cancelled_before_start = False
         if future is not None:
             cancelled_before_start = future.cancel()
@@ -910,16 +1044,19 @@ class WorkerRuntime:
                 with self._lock:
                     self._futures.pop(assignment_id, None)
         if not cancelled_before_start and phase == _PHASE_EXECUTING:
-            cancel = getattr(self.executor, "cancel", None)
-            if callable(cancel):
-                try:
-                    with self._executor_control_lock:
-                        cancel(assignment_id)
-                except Exception as exc:
-                    self.log(
-                        f"[{self.name}] executor cancellation failed for "
-                        f"{assignment_id}: {exc.__class__.__name__}: {exc}"
-                    )
+            self._cancel_executor(assignment_id)
+
+    def _cancel_executor(self, assignment_id: str) -> None:
+        cancel = getattr(self.executor, "cancel", None)
+        if callable(cancel):
+            try:
+                with self._executor_control_lock:
+                    cancel(assignment_id)
+            except Exception as exc:
+                self.log(
+                    f"[{self.name}] executor cancellation failed for "
+                    f"{assignment_id}: {exc.__class__.__name__}: {exc}"
+                )
 
     def _close_executor(self) -> None:
         close = getattr(self.executor, "close", None)

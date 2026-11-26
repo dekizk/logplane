@@ -164,11 +164,24 @@ retryable. When assignment ownership is lost or the runtime stops, a running
 subprocess is terminated and its result is suppressed. Shell execution is not
 used.
 
+On POSIX the command runs in its own session, and whenever an attempt ends
+(normal exit, timeout, cancellation, oversized output, worker shutdown) its
+whole process group is stopped: `SIGTERM`, then `SIGKILL` a second later. A
+process the command started therefore does not outlive the attempt, so do not
+rely on the command to leave a background service running. Because the
+command is no longer in the worker's own process group, a Ctrl-C in the
+terminal reaches it through the worker's shutdown rather than directly; a
+worker killed with `SIGKILL` cannot clean up and may leave it running. On
+Windows only the command itself is stopped.
+
 In-process Python threads cannot be force-killed safely. Such agents should
 pass `assignment.effect_id(...)` as an idempotency key that the receiving system
 enforces. If
 the wrapped object exposes `cancel(assignment_id)` or `close()`,
-`PythonAgentAdapter` forwards those lifecycle calls.
+`PythonAgentAdapter` forwards those lifecycle calls. An in-process agent has
+no time limit unless you give it one: see
+[limiting one attempt](operations.md#cancellation-and-deadlines) for the
+worker's `attempt_timeout_seconds`, and why a working `cancel` matters to it.
 
 The legacy unversioned `SubprocessExecutor` input remains readable for existing
 v0.4 integrations. New configuration files accept only protocol v1, so later

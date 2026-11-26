@@ -355,7 +355,7 @@ why they stopped in their exit status:
 | --- | --- |
 | 0 | it was asked to: Ctrl-C, or a replacement instance with the same name registered |
 | 75 | it could not reach the bus: the disconnect timeout ran out, or it could not read the log to check an incoming assignment |
-| 1 | of another failure: the bus refused a heartbeat or lifecycle write (a 4xx answer), or an assignment could not be resolved safely |
+| 1 | of another failure: the bus refused a heartbeat or lifecycle write (a 4xx answer), an assignment could not be resolved safely, or an executor ignored cancellation after an [attempt timeout](#cancellation-and-deadlines) |
 
 The second cause of 75 does not wait for the timeout and applies whether or
 not one is set: a worker that cannot verify an incoming assignment stops at
@@ -443,7 +443,43 @@ adapters that provide it, and suppresses late lifecycle output. This stops
 local execution at the cutoff even if PM reconciliation is temporarily down;
 the PM remains responsible for recording the authoritative terminal event.
 Python threads cannot be force-killed, so side effects must still be
-idempotent. Cancelled or deadline-exceeded prerequisites propagate
+idempotent.
+
+**Limiting one attempt.** A deadline bounds the whole task, and a worker's
+heartbeat says only that the worker process is alive, not that the agent is
+getting anywhere. So an executor with no time limit of its own, stuck on a
+call that never answers, holds its task and its worker indefinitely. A
+worker can be given a limit on each attempt:
+
+```sh
+logplane demo-worker alice --attempt-timeout 600
+```
+
+or `WorkerRuntime(..., attempt_timeout_seconds=600)` in code. It is off by
+default. When an attempt has been executing for that long, the worker calls
+the executor's `cancel(assignment_id)` and reports the attempt as
+`task.attempt_failed` with code `attempt_timeout`, a retryable failure, so the
+task is retried within its retry budget like any other failed attempt. The
+worker carries on with its next assignment.
+
+- The limit is wall-clock time from the moment execution starts, and it
+  includes any time the agent spends waiting for a person. Do not set it on a
+  worker whose agent waits for tool-call approvals.
+- The Claude Code, Codex, Hermes and OpenClaw example workers and the CLI and
+  HTTP adapters already limit each attempt themselves (`--timeout`,
+  `timeout_seconds`); the Claude Code worker's limit does not count approval
+  waits. This setting is for executors that have no limit: in-process Python
+  agents and your own `Executor` classes.
+- An executor has 10 seconds to return after being cancelled. If it does not
+  (Python code blocked in a call cannot be interrupted from outside), the
+  worker reports the timeout for it, so the task is released, and then stops
+  itself with exit status 1: the slot that call still occupies cannot be
+  reused, and a worker that kept heartbeating would be handed assignments it
+  could never start. The process cannot exit until the stuck call returns, so
+  a supervisor may need to kill it. Give in-process agents a `cancel` that
+  works, or their own timeouts, to avoid this.
+
+Cancelled or deadline-exceeded prerequisites propagate
 `task.dependency_failed` to downstream DAG tasks. Terminal tasks are not
 revived; create a new task to record new intent.
 

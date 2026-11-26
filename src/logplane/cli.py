@@ -1306,6 +1306,11 @@ def add_demo_worker_arguments(parser: argparse.ArgumentParser) -> None:
         "--delay", type=_nonnegative_number, default=0.5, metavar="SECONDS",
         help="simulated work time per task (default 0.5); raise it to kill a worker mid-task",
     )
+    parser.add_argument(
+        "--attempt-timeout", type=_positive_number, default=None, metavar="SECONDS",
+        help="stop any attempt that runs longer than this and report it as a "
+             "retryable failure (default: no limit)",
+    )
 
 
 def _positive_int(value: str) -> int:
