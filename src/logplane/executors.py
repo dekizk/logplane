@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -558,12 +561,35 @@ class InProcessExecutor:
             self._close()
 
 
+SUBPROCESS_STOP_GRACE_SECONDS = 1.0
+
+
+def _signal_process_group(process: subprocess.Popen, sig: int) -> bool:
+    """Signal the command's own process group; False when none could be.
+
+    Never raises. ProcessLookupError means the group is gone. PermissionError
+    is what macOS reports for a group with only zombies left in it, and
+    anywhere else it means we may not signal it; either way nothing more can
+    be done here.
+    """
+    try:
+        os.killpg(process.pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 class SubprocessExecutor:
     """Run a CLI executor using bounded JSON input and output contracts.
 
     Exit code 0 must produce one JSON outcome on stdout. Exit code 75 is a
     retryable process failure; other non-zero exits are permanent failures.
     Shell execution is deliberately disabled.
+
+    On POSIX the command runs in its own session, and every way an attempt
+    ends (exit, timeout, cancellation, oversized output, close) stops the
+    whole process group, so processes the command started do not outlive the
+    attempt. Elsewhere only the command itself is stopped.
     """
 
     def __init__(
@@ -650,6 +676,9 @@ class SubprocessExecutor:
                 stderr=subprocess.PIPE,
                 cwd=self.working_directory,
                 shell=False,
+                # Its own session, so its process group contains exactly the
+                # command and whatever it starts: see _terminate.
+                start_new_session=os.name == "posix",
             )
         except OSError as exc:
             return PermanentFailure(
@@ -702,6 +731,9 @@ class SubprocessExecutor:
             io_error = exc
             self._terminate(process)
         finally:
+            # Also after a normal exit: a child the command left running would
+            # keep working unsupervised and hold the output pipes open.
+            self._terminate(process)
             for reader in readers:
                 reader.join(timeout=1)
             with self._lock:
@@ -791,11 +823,34 @@ class SubprocessExecutor:
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
+        """Stop the command and, on POSIX, everything in its process group.
+
+        Safe to call more than once and after the command has exited; that is
+        how children it left behind are stopped.
+        """
+        if os.name != "posix":
+            if process.poll() is not None:
+                return
+            process.terminate()
+            try:
+                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
             return
-        process.terminate()
+
+        if _signal_process_group(process, signal.SIGTERM):
+            deadline = time.monotonic() + SUBPROCESS_STOP_GRACE_SECONDS
+            try:
+                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            # The command exiting is not the group exiting. Give the rest of
+            # the group what is left of the grace period, then insist.
+            while time.monotonic() < deadline and _signal_process_group(process, 0):
+                time.sleep(0.02)
+            _signal_process_group(process, signal.SIGKILL)
         try:
-            process.wait(timeout=1)
+            process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
+            pass

@@ -1,8 +1,12 @@
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from logplane.executors import (
@@ -214,6 +218,8 @@ class SubprocessConformanceTests(ExecutorConformanceMixin, unittest.TestCase):
                 pass
 
         class StartedProcess:
+            pid = 4_000_001  # never signalled for real: killpg is patched below
+
             def __init__(self):
                 self.stdin = FailingStdin()
                 self.stdout = EmptyPipe()
@@ -233,13 +239,132 @@ class SubprocessConformanceTests(ExecutorConformanceMixin, unittest.TestCase):
                 self.returncode = -9
 
         executor = SubprocessExecutor(["agent"])
-        with patch("logplane.executors.subprocess.Popen", return_value=StartedProcess()):
+        with (
+            patch("logplane.executors.subprocess.Popen", return_value=StartedProcess()),
+            patch("logplane.executors.os.killpg", side_effect=ProcessLookupError) as killpg,
+        ):
             result = executor.execute(assignment())
+        if os.name == "posix":
+            self.assertTrue(killpg.called)
+            self.assertEqual({4_000_001}, {call.args[0] for call in killpg.call_args_list})
         self.assertIsInstance(result, RetryableFailure)
         self.assertEqual("subprocess_io_failed", result.code)
         self.assertIn("write failed", result.reason)
         self.assertEqual({}, executor._processes)
         self.assertEqual(set(), executor._cancelled)
+
+
+# The command prints one outcome, after starting a child that appends to a
+# file for as long as it lives. A test knows the child is gone when the file
+# stops growing, which works even where exited processes linger as zombies.
+CHILD = "import sys,time\nwhile True:\n    open(sys.argv[1],'a').write('x'); time.sleep(0.02)\n"
+PARENT = (
+    "import json,os,subprocess,sys,time\n"
+    "sys.stdin.read()\n"
+    "options = json.loads(sys.argv[2])\n"
+    "child = subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]],\n"
+    "                         stdout=None if options.get('inherit') else subprocess.DEVNULL)\n"
+    "while not os.path.exists(sys.argv[1]) or not os.path.getsize(sys.argv[1]):\n"
+    "    time.sleep(0.01)\n"
+    "if options.get('ignore_term'):\n"
+    "    import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "if options.get('hang'):\n"
+    "    time.sleep(60)\n"
+    "print(json.dumps({{'status': 'completed', 'summary': 'own group: ' + str(os.getpgrp() == os.getpid())}}))\n"
+).format(child=CHILD)
+
+
+@unittest.skipIf(os.name != "posix", "process groups are a POSIX mechanism")
+class SubprocessProcessGroupTests(unittest.TestCase):
+    """An attempt that ends takes the processes it started with it."""
+
+    def executor(self, marker, **options):
+        timeout = options.pop("timeout", 20)
+        return SubprocessExecutor(
+            [sys.executable, "-c", PARENT, str(marker), json.dumps(options)], timeout=timeout
+        )
+
+    def wait_for_child(self, marker):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.stat().st_size:
+                return
+            time.sleep(0.01)
+        self.fail("the command never started its child")
+
+    def assert_child_stopped(self, marker):
+        size = marker.stat().st_size
+        time.sleep(0.3)  # fifteen of the child's write intervals
+        self.assertEqual(size, marker.stat().st_size, "the command's child is still running")
+
+    def test_a_timeout_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            result = self.executor(marker, hang=True, timeout=1.0).execute(assignment())
+            self.assertEqual("subprocess_timeout", result.code)
+            self.assertTrue(marker.stat().st_size)
+            self.assert_child_stopped(marker)
+
+    def test_cancellation_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True)
+            results = []
+            thread = threading.Thread(target=lambda: results.append(executor.execute(assignment())))
+            thread.start()
+            self.wait_for_child(marker)
+            executor.cancel("task:4:attempt:2")
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("subprocess_cancelled", results[0].code)
+            self.assert_child_stopped(marker)
+
+    def test_close_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True)
+            thread = threading.Thread(target=lambda: executor.execute(assignment()))
+            thread.start()
+            self.wait_for_child(marker)
+            executor.close()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assert_child_stopped(marker)
+
+    def test_a_command_that_ignores_sigterm_is_killed_with_its_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True, ignore_term=True)
+            results = []
+            thread = threading.Thread(target=lambda: results.append(executor.execute(assignment())))
+            thread.start()
+            self.wait_for_child(marker)
+            time.sleep(0.2)  # let the command install its SIGTERM handler
+            started = time.monotonic()
+            executor.cancel("task:4:attempt:2")
+            thread.join(6)
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started, 5)
+            self.assert_child_stopped(marker)
+
+    def test_a_child_left_running_after_a_normal_exit_is_stopped(self):
+        # The child inherits the command's stdout, so before this it also kept
+        # the output pipe open after the command had exited.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            started = time.monotonic()
+            result = self.executor(marker, inherit=True).execute(assignment())
+            self.assertIsInstance(result, Completed)
+            self.assertEqual("own group: True", result.summary)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assert_child_stopped(marker)
+
+    def test_stopping_twice_or_after_exit_is_harmless(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        process.wait(5)
+        SubprocessExecutor._terminate(process)
+        SubprocessExecutor._terminate(process)
+        self.assertEqual(0, process.returncode)
 
 
 class AssignmentContextTests(unittest.TestCase):
