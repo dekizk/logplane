@@ -579,6 +579,44 @@ def _signal_process_group(process: subprocess.Popen, sig: int) -> bool:
         return False
 
 
+def _stop_process_group(process: subprocess.Popen) -> None:
+    """Stop a command that leads its own process group, and the whole group.
+
+    Safe to call more than once and after the command has exited; that is how
+    children it left behind are stopped.
+    """
+    if _signal_process_group(process, signal.SIGTERM):
+        deadline = time.monotonic() + SUBPROCESS_STOP_GRACE_SECONDS
+        try:
+            process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        # The command exiting is not the group exiting. Give the rest of the
+        # group what is left of the grace period, then insist.
+        while time.monotonic() < deadline and _signal_process_group(process, 0):
+            time.sleep(0.02)
+        _signal_process_group(process, signal.SIGKILL)
+    try:
+        process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+_commands_get_own_group = True
+
+
+def share_process_group_with_commands() -> None:
+    """Keep every command this process starts inside this process's group.
+
+    For a process that is itself confined to one process group which its
+    parent stops as a whole, as the `adapter check` probe is. A command given
+    a session of its own would escape that, and nothing could stop it if this
+    process were killed first. Clean-up then has one owner: the parent.
+    """
+    global _commands_get_own_group
+    _commands_get_own_group = False
+
+
 class SubprocessExecutor:
     """Run a CLI executor using bounded JSON input and output contracts.
 
@@ -589,7 +627,11 @@ class SubprocessExecutor:
     On POSIX the command runs in its own session, and every way an attempt
     ends (exit, timeout, cancellation, oversized output, close) stops the
     whole process group, so processes the command started do not outlive the
-    attempt. Elsewhere only the command itself is stopped.
+    attempt. Elsewhere, and in a process that has called
+    share_process_group_with_commands(), only the command itself is stopped.
+
+    The timeout covers delivering the assignment on stdin as well as the
+    command's run: a command that never reads its input is stopped on time.
     """
 
     def __init__(
@@ -624,6 +666,7 @@ class SubprocessExecutor:
         self.working_directory = normalized_directory
         self._lock = threading.Lock()
         self._processes: dict[str, subprocess.Popen] = {}
+        self._own_groups: set[int] = set()
         self._active_calls: set[str] = set()
         self._cancelled: set[str] = set()
         self._closed = False
@@ -668,6 +711,7 @@ class SubprocessExecutor:
                     "subprocess executor is closed",
                 )
 
+        own_group = os.name == "posix" and _commands_get_own_group
         try:
             process = subprocess.Popen(
                 self.command,
@@ -678,7 +722,7 @@ class SubprocessExecutor:
                 shell=False,
                 # Its own session, so its process group contains exactly the
                 # command and whatever it starts: see _terminate.
-                start_new_session=os.name == "posix",
+                start_new_session=own_group,
             )
         except OSError as exc:
             return PermanentFailure(
@@ -687,14 +731,22 @@ class SubprocessExecutor:
             )
 
         with self._lock:
-            if self._closed or assignment.assignment_id in self._cancelled:
-                self._terminate(process)
+            if own_group:
+                self._own_groups.add(process.pid)
+            lost_ownership = self._closed or assignment.assignment_id in self._cancelled
+            if lost_ownership:
                 self._cancelled.discard(assignment.assignment_id)
-                return RetryableFailure(
-                    "subprocess_cancelled",
-                    "subprocess execution lost assignment ownership",
-                )
-            self._processes[assignment.assignment_id] = process
+            else:
+                self._processes[assignment.assignment_id] = process
+        if lost_ownership:
+            # Outside the lock: _terminate takes it.
+            self._terminate(process)
+            with self._lock:
+                self._own_groups.discard(process.pid)
+            return RetryableFailure(
+                "subprocess_cancelled",
+                "subprocess execution lost assignment ownership",
+            )
 
         stdout = bytearray()
         stderr = bytearray()
@@ -713,15 +765,19 @@ class SubprocessExecutor:
         )
         for reader in readers:
             reader.start()
+        # The assignment is written from its own thread so that the timeout
+        # below also covers delivering it: a command that never reads its
+        # input would otherwise block this thread before the clock started.
+        write_errors: list[OSError] = []
+        writer = threading.Thread(
+            target=self._write_input,
+            args=(process, input_bytes, write_errors),
+            daemon=True,
+        )
+        writer.start()
         timed_out = False
         io_error: Optional[OSError] = None
         try:
-            try:
-                if process.stdin is not None:
-                    process.stdin.write(input_bytes)
-                    process.stdin.close()
-            except BrokenPipeError:
-                pass
             try:
                 process.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired:
@@ -734,10 +790,14 @@ class SubprocessExecutor:
             # Also after a normal exit: a child the command left running would
             # keep working unsupervised and hold the output pipes open.
             self._terminate(process)
+            writer.join(timeout=1)
             for reader in readers:
                 reader.join(timeout=1)
             with self._lock:
                 self._processes.pop(assignment.assignment_id, None)
+                self._own_groups.discard(process.pid)
+        if io_error is None and write_errors:
+            io_error = write_errors[0]
 
         with self._lock:
             cancelled = assignment.assignment_id in self._cancelled
@@ -797,6 +857,26 @@ class SubprocessExecutor:
         for _, process in processes:
             self._terminate(process)
 
+    def _write_input(
+        self,
+        process: subprocess.Popen,
+        input_bytes: bytes,
+        errors: list[OSError],
+    ) -> None:
+        try:
+            if process.stdin is not None:
+                process.stdin.write(input_bytes)
+                process.stdin.close()
+        except BrokenPipeError:
+            # The command exited, or was stopped, without reading all of it.
+            pass
+        except OSError as exc:
+            errors.append(exc)
+            self._terminate(process)
+        except ValueError:
+            # The pipe was closed under us while the attempt was being stopped.
+            pass
+
     def _read_bounded_pipe(
         self,
         pipe,
@@ -821,36 +901,21 @@ class SubprocessExecutor:
         finally:
             pipe.close()
 
-    @staticmethod
-    def _terminate(process: subprocess.Popen) -> None:
-        """Stop the command and, on POSIX, everything in its process group.
+    def _terminate(self, process: subprocess.Popen) -> None:
+        """Stop the command, and its whole process group when it has its own.
 
-        Safe to call more than once and after the command has exited; that is
-        how children it left behind are stopped.
+        Safe to call more than once and after the command has exited.
         """
-        if os.name != "posix":
-            if process.poll() is not None:
-                return
-            process.terminate()
-            try:
-                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
+        with self._lock:
+            own_group = process.pid in self._own_groups
+        if own_group:
+            _stop_process_group(process)
             return
-
-        if _signal_process_group(process, signal.SIGTERM):
-            deadline = time.monotonic() + SUBPROCESS_STOP_GRACE_SECONDS
-            try:
-                process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-            # The command exiting is not the group exiting. Give the rest of
-            # the group what is left of the grace period, then insist.
-            while time.monotonic() < deadline and _signal_process_group(process, 0):
-                time.sleep(0.02)
-            _signal_process_group(process, signal.SIGKILL)
+        if process.poll() is not None:
+            return
+        process.terminate()
         try:
             process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            pass
+            process.kill()
+            process.wait(timeout=SUBPROCESS_STOP_GRACE_SECONDS)

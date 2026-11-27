@@ -218,6 +218,65 @@ class AttemptTimeoutTests(RuntimeTestCase):
         self.assertEqual(0, runtime.active_count)
         self.assertEqual(ERROR_EXIT_CODE, runtime.exit_code)
 
+    def test_a_retiring_worker_stops_even_if_its_report_never_gets_through(self):
+        # Heartbeats keep succeeding while the failure report is never
+        # acknowledged. The worker must not stay registered, renewing its
+        # lease and taking work, for as long as that lasts.
+        release = threading.Event()
+        counts = {"reports": 0, "heartbeats_after": 0}
+        abandoned = threading.Event()
+
+        class Stuck:
+            def execute(self, assignment):
+                release.wait(5)
+                return Completed("far too late")
+
+        class Bus(FakeBus):
+            def publish(self, topic, payload, **kwargs):
+                if topic == "task.attempt_failed":
+                    abandoned.set()
+                    counts["reports"] += 1
+                    raise httpx.ConnectError("never acknowledged")
+                if topic == "agent.heartbeat" and abandoned.is_set():
+                    counts["heartbeats_after"] += 1
+                return super().publish(topic, payload, **kwargs)
+
+        bus = Bus()
+        self.messages = []
+        runtime = WorkerRuntime(
+            bus, name="alice", instance_id="alice-1", executor=Stuck(), capacity=2,
+            heartbeat_seconds=0.02, publish_retry_seconds=0.02,
+            attempt_timeout_seconds=0.05, log=self.messages.append,
+        )
+
+        def events():
+            yield assigned_event()
+            self.assertTrue(abandoned.wait(3))
+            # A second slot is free, but a retiring worker takes nothing new.
+            yield assigned_event(task_id=2, event_id=11)
+            started = time.monotonic()
+            self.assertTrue(runtime.stop_event.wait(3))
+            self.assertLess(time.monotonic() - started, 2)
+            release.set()
+
+        with (
+            patch.object(runtime_module, "ATTEMPT_CANCEL_GRACE_SECONDS", 0.05),
+            patch.object(runtime_module, "ATTEMPT_REPORT_SECONDS", 0.2),
+        ):
+            try:
+                runtime.run(events())
+            finally:
+                release.set()
+        self.assertGreaterEqual(counts["reports"], 2)   # it did retry...
+        self.assertLess(counts["reports"], 30)          # ...for a bounded time
+        self.assertLessEqual(counts["heartbeats_after"], 1)  # at most one already in flight
+        self.assertEqual([1], [e["payload"]["task_id"] for e in published(bus, "task.started")])
+        self.assertEqual([], published(bus, "task.attempt_failed"))
+        self.assertEqual(ERROR_EXIT_CODE, runtime.exit_code)
+        self.assertTrue(any("could not report the timeout" in line for line in self.messages))
+        # It still says it has stopped, so the coordinator need not wait.
+        self.assertEqual(1, len(published(bus, "agent.stopped")))
+
     def test_an_executor_that_stops_within_the_grace_keeps_the_worker_running(self):
         release = threading.Event()
 

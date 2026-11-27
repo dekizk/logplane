@@ -20,17 +20,20 @@
   been executing that long and reports it as a retryable `attempt_timeout`
   failure, so a hung agent no longer holds its task and worker for as long as
   the worker keeps heartbeating. It is for executors with no limit of their
-  own; the example workers and the CLI and HTTP adapters already have one. An
-  executor that ignores cancellation for 10 seconds has the timeout reported
-  for it and the worker stops with exit status 1. The demo worker's executor
-  now honours cancellation, so the demo worker also stops promptly.
+  own; the example workers and the CLI and HTTP adapters already have one. A
+  worker whose executor ignores cancellation for 10 seconds retires: it takes
+  no more work, stops renewing its lease, reports the timeout if it can, and
+  stops with exit status 1. The demo worker's executor now honours
+  cancellation, so the demo worker also stops promptly.
 - **The subprocess executor stops the whole process tree.** On POSIX,
   `SubprocessExecutor` and the CLI adapter run the command in its own session
   and stop its process group whenever an attempt ends: exit, timeout,
   cancellation, oversized output or shutdown. Processes the command started
   used to keep running after a timeout or cancellation, and could hold the
   output pipes open after a normal exit. A command that deliberately left a
-  background process running will now have it stopped.
+  background process running will now have it stopped. The timeout now also
+  covers writing the assignment to the command: one that never read a large
+  input used to block the worker before the timeout had started.
 
 - **A worker can give up on a bus that stays unreachable.** Off by default.
   Set `LOGPLANE_WORKER_DISCONNECT_TIMEOUT_SECONDS` in the worker's

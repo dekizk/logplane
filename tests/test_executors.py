@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from logplane import executors
 from logplane.executors import (
     AssignmentContext,
     Blocked,
@@ -362,9 +363,79 @@ class SubprocessProcessGroupTests(unittest.TestCase):
     def test_stopping_twice_or_after_exit_is_harmless(self):
         process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
         process.wait(5)
-        SubprocessExecutor._terminate(process)
-        SubprocessExecutor._terminate(process)
+        executors._stop_process_group(process)
+        executors._stop_process_group(process)
         self.assertEqual(0, process.returncode)
+
+    def test_a_process_that_owns_cleanup_keeps_commands_in_its_own_group(self):
+        # The adapter-check probe is stopped as one process group by its
+        # parent. A command given its own session would escape that, so there
+        # the command stays in the group and only it is signalled directly.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(executors, "_commands_get_own_group", True):
+            executors.share_process_group_with_commands()
+            marker = Path(directory, "alive")
+            with patch("logplane.executors.os.killpg") as killpg:
+                result = self.executor(marker).execute(assignment())
+            self.assertIsInstance(result, Completed)
+            self.assertEqual("own group: False", result.summary)
+            killpg.assert_not_called()  # it would have signalled this test run
+            # Nothing here stops the child: that is the group owner's job.
+            size = marker.stat().st_size
+            time.sleep(0.2)
+            self.assertGreater(marker.stat().st_size, size)
+            subprocess.run(["pkill", "-f", str(marker)], check=False)
+
+    def test_the_timeout_also_covers_delivering_the_assignment(self):
+        # More input than a pipe holds, and a command that never reads it.
+        # The write used to block before the timeout had started.
+        executor = SubprocessExecutor(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=0.5, max_protocol_bytes=1024 * 1024,
+        )
+        results = []
+        thread = threading.Thread(target=lambda: results.append(
+            executor.execute(assignment(context={"blob": "x" * 256_000}))), daemon=True)
+        started = time.monotonic()
+        thread.start()
+        thread.join(8)
+        try:
+            self.assertFalse(thread.is_alive(), "blocked writing to a command that never reads")
+            self.assertEqual("subprocess_timeout", results[0].code)
+            self.assertLess(time.monotonic() - started, 6)
+        finally:
+            executor.close()
+
+    def test_a_large_assignment_still_arrives_whole(self):
+        code = ("import json,sys; request=sys.stdin.read(); "
+                "print(json.dumps({'status':'completed','summary':str(len(request))}))")
+        executor = SubprocessExecutor([sys.executable, "-c", code], timeout=20,
+                                      max_protocol_bytes=1024 * 1024)
+        result = executor.execute(assignment(context={"blob": "x" * 256_000}))
+        self.assertIsInstance(result, Completed)
+        self.assertGreater(int(result.summary), 256_000)
+
+    def test_a_command_closed_before_it_started_is_stopped_without_deadlock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = self.executor(Path(directory, "alive"), hang=True)
+            started = threading.Event()
+            spawn = subprocess.Popen
+
+            def spawn_then_close(*args, **kwargs):
+                process = spawn(*args, **kwargs)
+                executor.close()  # ownership is lost while the command starts
+                started.set()
+                return process
+
+            results = []
+            with patch("logplane.executors.subprocess.Popen", side_effect=spawn_then_close):
+                thread = threading.Thread(
+                    target=lambda: results.append(executor.execute(assignment())), daemon=True)
+                thread.start()
+                thread.join(8)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("subprocess_cancelled", results[0].code)
+            self.assertEqual(set(), executor._own_groups)
 
 
 class AssignmentContextTests(unittest.TestCase):

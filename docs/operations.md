@@ -486,12 +486,15 @@ worker carries on with its next assignment.
   agents and your own `Executor` classes.
 - An executor has 10 seconds to return after being cancelled. If it does not
   (Python code blocked in a call cannot be interrupted from outside), the
-  worker reports the timeout for it, so the task is released, and then stops
-  itself with exit status 1: the slot that call still occupies cannot be
-  reused, and a worker that kept heartbeating would be handed assignments it
-  could never start. The process cannot exit until the stuck call returns, so
-  a supervisor may need to kill it. Give in-process agents a `cancel` that
-  works, or their own timeouts, to avoid this.
+  worker retires: the slot that call still occupies cannot be reused, and a
+  worker that kept heartbeating would be handed assignments it could never
+  start. From that moment it accepts no work and stops renewing its lease. It
+  tries for up to 10 seconds to report the timeout, then announces that it has
+  stopped and ends with exit status 1. If neither message gets through, the
+  lease running out frees its tasks as for any lost worker. The process cannot
+  exit until the stuck call returns, so a supervisor may need to kill it. Give
+  in-process agents a `cancel` that works, or their own timeouts, to avoid
+  this.
 
 Cancelled or deadline-exceeded prerequisites propagate
 `task.dependency_failed` to downstream DAG tasks. Terminal tasks are not

@@ -160,7 +160,9 @@ logplane adapter run adapter.json
 
 Exit code `75` maps to a retryable process failure; other non-zero exits map to
 permanent failure. Input, stdout, and stderr are size-limited. Timeouts are
-retryable. When assignment ownership is lost or the runtime stops, a running
+retryable, and the timeout covers delivering the assignment on stdin as well
+as the command's run, so a command that never reads its input is still stopped
+on time. When assignment ownership is lost or the runtime stops, a running
 subprocess is terminated and its result is suppressed. Shell execution is not
 used.
 
@@ -172,7 +174,10 @@ rely on the command to leave a background service running. Because the
 command is no longer in the worker's own process group, a Ctrl-C in the
 terminal reaches it through the worker's shutdown rather than directly; a
 worker killed with `SIGKILL` cannot clean up and may leave it running. On
-Windows only the command itself is stopped.
+Windows only the command itself is stopped. `logplane adapter check` is the
+one exception: its probe process and everything under it already form a
+single group that the check stops as a whole, so there the command stays in
+that group.
 
 In-process Python threads cannot be force-killed safely. Such agents should
 pass `assignment.effect_id(...)` as an idempotency key that the receiving system

@@ -44,6 +44,9 @@ STREAM_READ_TIMEOUT_SECONDS = 30.0
 # cancel. Past this the worker reports the timeout itself and stops, because
 # the slot that executor still occupies cannot be reclaimed.
 ATTEMPT_CANCEL_GRACE_SECONDS = 10.0
+# How long that worker keeps trying to deliver the timeout report before it
+# stops anyway and leaves the task to its lease.
+ATTEMPT_REPORT_SECONDS = 10.0
 DEFAULT_DEPENDENCY_FETCH_ATTEMPTS = 3
 RUNTIME_TOPICS = (
     "agent.registered",
@@ -901,9 +904,11 @@ class WorkerRuntime:
         assignment: AssignmentContext,
         lifecycle: dict,
         outcome: Union[RetryableFailure, PermanentFailure],
-    ) -> None:
+        *,
+        give_up_at: Optional[float] = None,
+    ) -> Optional[dict]:
         retryable = isinstance(outcome, RetryableFailure)
-        self._publish_while_owned(
+        return self._publish_while_owned(
             assignment.assignment_id,
             "task.attempt_failed",
             {
@@ -920,6 +925,7 @@ class WorkerRuntime:
             },
             caused_by=assignment.assignment_event_id,
             idempotency_key=f"attempt-failed:{assignment.assignment_id}",
+            give_up_at=give_up_at,
         )
 
     def _forget_assignment(self, assignment_id: str) -> None:
@@ -988,11 +994,14 @@ class WorkerRuntime:
         self._cancel_executor(assignment_id)
 
     def _attempt_abandoned(self, assignment: AssignmentContext, lifecycle: dict) -> None:
-        """The executor ignored cancellation: report for it, then stop.
+        """The executor ignored cancellation: retire this worker.
 
         Its thread is still inside execute(), so the slot cannot be reused. A
         worker that kept heartbeating would be handed assignments it could
-        never start, so it stops and lets its lease lapse instead.
+        never start. So it takes no more work and renews its lease no further
+        from this moment, tries for a bounded time to report the timeout, and
+        stops whether or not that got through: the lease running out frees
+        its tasks if nothing else does.
         """
         assignment_id = assignment.assignment_id
         with self._lock:
@@ -1005,13 +1014,25 @@ class WorkerRuntime:
             # From here the executor's eventual return is discarded.
             self._assignment_phases[assignment_id] = _PHASE_PUBLISHING_OUTCOME
             self._abandoned.add(assignment_id)
+            self._accepting = False
+        self._heartbeat_stop.set()
         self.log(
             f"[{self.name}] executor did not stop within "
             f"{ATTEMPT_CANCEL_GRACE_SECONDS:g}s of cancellation: {assignment_id}; "
             "reporting the timeout and stopping this worker, because the slot "
             "it occupies cannot be reclaimed"
         )
-        self._publish_attempt_failed(assignment, lifecycle, self._attempt_timeout_outcome())
+        reported = self._publish_attempt_failed(
+            assignment,
+            lifecycle,
+            self._attempt_timeout_outcome(),
+            give_up_at=time.monotonic() + ATTEMPT_REPORT_SECONDS,
+        )
+        if reported is None:
+            self.log(
+                f"[{self.name}] could not report the timeout for {assignment_id}; "
+                "the coordinator will recover it when this worker's lease expires"
+            )
         self._forget_assignment(assignment_id)
         with self._lock:
             self._abandoned.discard(assignment_id)
@@ -1029,7 +1050,13 @@ class WorkerRuntime:
         *,
         caused_by: int,
         idempotency_key: str,
+        give_up_at: Optional[float] = None,
     ) -> Optional[dict]:
+        """Publish, retrying transient failures for as long as it is ours.
+
+        give_up_at (a time.monotonic() value) bounds the retries for a caller
+        that must not wait on the bus indefinitely.
+        """
         while self._owns(assignment_id) and not self.stop_event.is_set():
             try:
                 sent = self.bus.publish(
@@ -1050,6 +1077,8 @@ class WorkerRuntime:
                     self.stop_event.set()
                     return None
                 self._write_failed()
+                if give_up_at is not None and time.monotonic() >= give_up_at:
+                    break
                 self.log(
                     f"[{self.name}] publish failed ({exc.__class__.__name__}); "
                     f"retrying {topic}"
@@ -1058,6 +1087,8 @@ class WorkerRuntime:
                     break
             except httpx.HTTPError as exc:
                 self._write_failed()
+                if give_up_at is not None and time.monotonic() >= give_up_at:
+                    break
                 self.log(
                     f"[{self.name}] publish failed ({exc.__class__.__name__}); "
                     f"retrying {topic}"
