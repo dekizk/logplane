@@ -283,18 +283,31 @@ reopens a task that ran out of either allowance, and its
 whether each ends in a failure or a lost worker.
 
 Stopping a worker on purpose is not losing one. A worker stopped with Ctrl-C
-or `SIGTERM` cancels its running attempts, waits for its executors to return,
-and then publishes `agent.stopped`. The coordinator hands the work back the
-moment it reads that, without waiting for the lease to run out, and does not
-count it: the next attempt can start on another worker within a second, and
-"lost workers" and the retry budget are untouched. `logplane workers` shows
-the worker as `stopped`, and it is given no new work until a new process
-registers under the name. A worker that stops itself over a failure (see the
-exit statuses below) announces the stop in the same way, so its work is also
-handed back at once, but an attempt it had already started counts as a lost
-worker; one it had not started never does. If the announcement cannot be
-delivered, or the worker is killed outright (`SIGKILL`, a crash, a power
-cut), nothing is announced and the lease rules above apply as before.
+or `SIGTERM` that has work running first publishes `agent.stopping`, so the
+coordinator sends it nothing more. It cancels its running attempts and waits
+for its executors to return, still heartbeating so that the work is not
+handed to another worker while it may still be running here. Then it
+publishes `agent.stopped`. The coordinator hands the work back the moment it
+reads that, without waiting for the lease to run out, and does not count it:
+the next attempt can start on another worker within a second, and "lost
+workers" and the retry budget are untouched. `logplane workers` shows the
+worker as `stopping` and then `stopped`, and it is given no new work until a
+new process registers under the name. Starting the worker again straight away
+is safe: the hand-back is remembered against the work the old process held,
+not against the name.
+
+The wait for executors is limited to 10 seconds. An executor that ignores
+cancellation for longer does not keep the worker looking alive: the worker
+stops heartbeating and publishes `agent.stopped` anyway, and the work moves
+on. The old call may then still be running alongside the new attempt, and the
+process cannot exit until it returns.
+
+A worker that stops itself over a failure (see the exit statuses below)
+announces the stop in the same way, so its work is also handed back at once,
+but an attempt it had already started counts as a lost worker; one it had not
+started never does. If the announcements cannot be delivered, or the worker
+is killed outright (`SIGKILL`, a crash, a power cut), nothing is announced
+and the lease rules above apply as before.
 
 The coordinator also avoids expiring leases it cannot judge. Old heartbeats
 mean it was not watching, not that workers died, in three cases: when it
@@ -488,9 +501,10 @@ worker carries on with its next assignment.
   (Python code blocked in a call cannot be interrupted from outside), the
   worker retires: the slot that call still occupies cannot be reused, and a
   worker that kept heartbeating would be handed assignments it could never
-  start. From that moment it accepts no work and stops renewing its lease. It
-  tries for up to 10 seconds to report the timeout, then announces that it has
-  stopped and ends with exit status 1. If neither message gets through, the
+  start. From that moment it accepts no work, stops renewing its lease, and
+  publishes `agent.stopping` so the retry is not sent back to it. It tries for
+  up to 10 seconds to report the timeout, then announces that it has stopped
+  and ends with exit status 1. If none of those messages gets through, the
   lease running out frees its tasks as for any lost worker. The process cannot
   exit until the stuck call returns, so a supervisor may need to kill it. Give
   in-process agents a `cancel` that works, or their own timeouts, to avoid

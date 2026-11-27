@@ -229,10 +229,12 @@ available.
 The PM also reconciles on SSE keepalives, so lease expiry does not depend on a
 new task or heartbeat arriving after a worker dies.
 
-A worker that stops in an orderly way publishes `agent.stopped`, which ends
-its lease at that event instead of a lease period later. The PM expires its
-attempts at once and marks them `released` when the stop was requested, so
-they are not charged to the task; see
+A worker that stops in an orderly way publishes `agent.stopping` while its
+executors wind down, which takes it out of assignment without touching its
+lease, and then `agent.stopped`, which ends its lease at that event instead
+of a lease period later. The PM expires its attempts at once and marks them
+`released` when the stop was requested, so they are not charged to the task;
+see
 [bounded retries](operations.md#bounded-retries-and-terminal-failure).
 
 Lease age is the PM's clock against the last heartbeat it has read, so a PM

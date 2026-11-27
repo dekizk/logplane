@@ -3,16 +3,20 @@
 ## Unreleased
 
 - **A worker stopped on purpose hands its work back at once.** A worker
-  stopped with Ctrl-C or `SIGTERM` now cancels its attempts and publishes a
-  new `agent.stopped` event. The coordinator reassigns the work as soon as it
-  reads that, and does not count it against the task's lost-worker allowance
-  or retry budget. Before, the work waited for the lease to run out (20
-  seconds by default, and longer while a cancelled executor was still
-  finishing) and each stop used one of the task's three lost workers.
-  `task.assignment_expired` gains an optional `released` flag,
-  `logplane workers` shows a `stopped` status, and `WorkerRuntime.run()` now
-  treats `SIGTERM` like Ctrl-C when no other handler is installed. A worker
-  that is killed outright is still recovered by its lease, as before.
+  stopped with Ctrl-C or `SIGTERM` now publishes `agent.stopping` if it has
+  work running, so it is sent nothing more, cancels its attempts, and
+  publishes `agent.stopped` once its executors have returned. The coordinator
+  reassigns the work as soon as it reads that, and does not count it against
+  the task's lost-worker allowance or retry budget, even if the worker has
+  already been started again under the same name. Before, the work waited for
+  the lease to run out (20 seconds by default, and for as long as a cancelled
+  executor took to finish) and each stop used one of the task's three lost
+  workers. An executor that ignores cancellation holds the hand-back up for
+  at most 10 seconds. `task.assignment_expired` gains an optional `released`
+  flag, `logplane workers` shows `stopping` and `stopped`, and
+  `WorkerRuntime.run()` now treats `SIGTERM` like Ctrl-C when no other handler
+  is installed. A worker that is killed outright is still recovered by its
+  lease, as before.
 
 - **A worker can limit how long one attempt runs.** Off by default.
   `logplane demo-worker --attempt-timeout SECONDS`, or

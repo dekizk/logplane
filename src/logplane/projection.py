@@ -39,6 +39,9 @@ class WorkerRecord:
     capabilities: frozenset[str] = field(default_factory=frozenset)
     last_event_id: int = 0
     registered_event_id: int = 0
+    # Set by agent.stopping: this process is winding down. It keeps the lease
+    # on what it holds for as long as it heartbeats, but is sent nothing new.
+    stopping_event_id: Optional[int] = None
     # Set by agent.stopped: this process announced that it has stopped. It
     # holds no lease from then on, however recent its last heartbeat was.
     stopped_event_id: Optional[int] = None
@@ -75,6 +78,11 @@ class TaskRecord:
     retry_grant_base: int = 0
     assignee: Optional[str] = None
     worker_instance_id: Optional[str] = None
+    # Not None once the process holding the current assignment has announced
+    # that it stopped; the value is whether it was asked to. Kept on the task
+    # because the worker record is replaced when the name registers again,
+    # which can happen before the PM has handed this assignment back.
+    assignee_stop_requested: Optional[bool] = None
     assignment_id: Optional[str] = None
     assignment_event_id: Optional[int] = None
     assignment_policy_event_id: Optional[int] = None
@@ -237,7 +245,8 @@ class PMState:
         return [
             worker
             for worker in self.workers.values()
-            if worker.stopped_event_id is None
+            if worker.stopping_event_id is None
+            and worker.stopped_event_id is None
             and now - worker.last_seen <= lease_seconds
         ]
 
@@ -551,6 +560,7 @@ def _active_assignment_matches(
 def _clear_active_assignment(task: TaskRecord) -> None:
     task.assignee = None
     task.worker_instance_id = None
+    task.assignee_stop_requested = None
     task.assignment_id = None
     task.assignment_event_id = None
 
@@ -717,6 +727,35 @@ def _apply_agent_heartbeat(
     return True
 
 
+def _apply_agent_stopping(
+    state: PMState,
+    ev: dict,
+    payload: dict,
+    event_id: int,
+    timestamp: float,
+) -> bool:
+    """The named process is winding down: send it nothing new.
+
+    Its lease on what it already holds is unaffected, so nothing is handed to
+    another worker while its executors may still be running.
+    """
+    name = payload.get("name")
+    instance_id = payload.get("instance_id")
+    worker = state.workers.get(name) if isinstance(name, str) else None
+    if (
+        worker is None
+        or ev.get("actor") != name
+        or instance_id != worker.instance_id
+        or event_id <= worker.last_event_id
+        or worker.stopping_event_id is not None
+        or worker.stopped_event_id is not None
+    ):
+        return False
+    worker.stopping_event_id = event_id
+    worker.last_event_id = event_id
+    return True
+
+
 def _apply_agent_stopped(
     state: PMState,
     ev: dict,
@@ -743,6 +782,16 @@ def _apply_agent_stopped(
     worker.stopped_event_id = event_id
     worker.stop_requested = payload.get("requested") is True
     worker.last_event_id = event_id
+    # Remember the stop on each assignment this process held. The worker
+    # record alone is not enough: the name may register again before the PM
+    # has handed these back, and that replaces the record.
+    for task in state.tasks.values():
+        if (
+            task.status in ACTIVE_TASK_STATUSES
+            and task.assignee == name
+            and task.worker_instance_id == instance_id
+        ):
+            task.assignee_stop_requested = worker.stop_requested
     return True
 
 
@@ -1468,6 +1517,15 @@ def _apply_task_assigned(
     task.attempt = attempt
     task.assignee = assignee
     task.worker_instance_id = worker_instance_id
+    # An assignment the PM planned before it had read the stop: the process
+    # will never start it.
+    task.assignee_stop_requested = (
+        worker.stop_requested
+        if worker is not None
+        and worker.instance_id == worker_instance_id
+        and worker.stopped_event_id is not None
+        else None
+    )
     task.assignment_id = assignment_id
     task.assignment_event_id = event_id
     task.assignment_policy_event_id = assignment_policy_event_id
@@ -2176,6 +2234,7 @@ TaskHandler = Callable[[PMState, dict, dict, int, float, int, TaskRecord], bool]
 _AGENT_AND_USAGE_HANDLERS: dict[str, AgentHandler] = {
     "agent.registered": _apply_agent_registered,
     "agent.heartbeat": _apply_agent_heartbeat,
+    "agent.stopping": _apply_agent_stopping,
     "agent.stopped": _apply_agent_stopped,
     "agent.policy_set": _apply_agent_policy_set,
     "workflow.usage_recorded": _apply_workflow_usage_recorded,

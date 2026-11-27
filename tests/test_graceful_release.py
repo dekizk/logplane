@@ -28,6 +28,11 @@ LEASE = 20.0
 NOW = 101.0  # one second after every fixture event: all leases are fresh
 
 
+def stopping(event_id, *, name="alice", instance="alice-1", actor=None):
+    return event(event_id, "agent.stopping", actor or name,
+                 {"name": name, "instance_id": instance})
+
+
 def stopped(event_id, *, name="alice", instance="alice-1", requested=True, actor=None):
     return event(event_id, "agent.stopped", actor or name,
                  {"name": name, "instance_id": instance, "requested": requested})
@@ -89,6 +94,36 @@ class StopEventTests(unittest.TestCase):
         view, = worker_views(state, now=NOW, lease_seconds=LEASE)
         self.assertEqual("stopped", view["status"])
 
+    def test_a_stopping_worker_keeps_what_it_holds_but_is_sent_nothing_new(self):
+        validate_event("agent.stopping", "alice",
+                       {"name": "alice", "instance_id": "alice-1"}, None, None, 2)
+        with self.assertRaises(EventValidationError):
+            validate_event("agent.stopping", "mallory",
+                           {"name": "alice", "instance_id": "alice-1"}, None, None, 2)
+
+        events = [registered(), with_lease_policy(created(2)), assigned(3, 1), started(4, 1),
+                  with_lease_policy(created(5, task_id=2)), stopping(6), heartbeat(7, ts=100.9)]
+        state = replay_events(events)
+        worker = state.workers["alice"]
+        self.assertEqual((6, None, 100.9),
+                         (worker.stopping_event_id, worker.stopped_event_id, worker.last_seen))
+        self.assertEqual([], state.active_workers(NOW, LEASE))
+        view, = worker_views(state, now=NOW, lease_seconds=LEASE)
+        self.assertEqual("stopping", view["status"])
+        # Task 1 stays where it is while its executor may still be running,
+        # and task 2 is not sent to a worker that is on its way out.
+        self.assertIsNone(plan(events))
+        explained = explain_task(state, 1, now=NOW, lease_seconds=LEASE)
+        self.assertEqual("active_lease_healthy", explained["code"])
+        # Only the registered instance can say so, and only once.
+        for impostor in (stopping(2, instance="alice-0"), stopping(2, actor="mallory")):
+            self.assertIsNone(replay_events([registered(), impostor]).workers["alice"].stopping_event_id)
+        self.assertEqual(2, replay_events([registered(), stopping(2), stopping(3)])
+                         .workers["alice"].stopping_event_id)
+        # A stopping worker that then goes quiet is recovered by its lease.
+        expiry = plan_next_emission(replay_events(events), now=NOW + 60, lease_seconds=LEASE)
+        self.assertEqual("worker lease expired", expiry["payload"]["reason"])
+
     def test_only_the_registered_instance_can_stop_itself(self):
         for label, impostor in (
             ("a replaced process", stopped(2, instance="alice-0")),
@@ -142,6 +177,58 @@ class HandBackTests(unittest.TestCase):
                 self.assertEqual(("task.assigned", 2, "bob"),
                                  (again["topic"], again["payload"]["attempt"],
                                   again["payload"]["assignee"]))
+
+    def test_a_quick_restart_under_the_same_name_is_still_a_release(self):
+        # The new process registers before the coordinator has handed the old
+        # one's work back. That replaces the worker record, and used to turn
+        # the hand-back into a lost worker: with no allowance, a failed task.
+        task = with_lease_policy(created(2), 0)
+        events = [registered(), task, assigned(3, 1), started(4, 1),
+                  stopped(5), registered(6, instance="alice-2")]
+        state = replay_events(events)
+        self.assertIs(True, state.tasks[1].assignee_stop_requested)
+        self.assertEqual("active_worker_stopped",
+                         explain_task(state, 1, now=NOW, lease_seconds=LEASE)["code"])
+        planned = plan(events)
+        self.assertEqual(("task.assignment_expired", "worker stopped", True),
+                         (planned["topic"], planned["payload"]["reason"],
+                          planned["payload"]["released"]))
+        events = record(events, planned)
+        task = replay_events(events).tasks[1]
+        self.assertEqual(("open", 0, 0, None),
+                         (task.status, task.retryable_failures, task.lease_expiries,
+                          task.assignee_stop_requested))
+        again = plan(events)
+        self.assertEqual(("task.assigned", "alice-2", 2),
+                         (again["topic"], again["payload"]["worker_instance_id"],
+                          again["payload"]["attempt"]))
+
+    def test_a_failure_stop_followed_by_a_restart_is_still_charged(self):
+        events = [registered(), with_lease_policy(created(2), 0), assigned(3, 1), started(4, 1),
+                  stopped(5, requested=False), registered(6, instance="alice-2")]
+        planned = plan(events)
+        self.assertEqual("worker stopped", planned["payload"]["reason"])
+        self.assertNotIn("released", planned["payload"])
+        self.assertEqual("lease_expiry_limit_exhausted",
+                         plan(record(events, planned))["payload"]["reason_code"])
+
+    def test_an_assignment_planned_before_the_stop_was_read_is_released(self):
+        # The coordinator had not yet read the stop when it chose this worker.
+        events = [registered(), registered(2, name="bob", instance="bob-1"),
+                  with_lease_policy(created(3), 0), stopped(4, requested=False), assigned(5, 1)]
+        state = replay_events(events)
+        self.assertIs(False, state.tasks[1].assignee_stop_requested)
+        planned = plan(events)
+        self.assertIs(True, planned["payload"]["released"])  # it never started
+        events = record(events, planned)
+        self.assertEqual("bob", plan(events)["payload"]["assignee"])
+
+    def test_a_replaced_worker_that_never_announced_is_charged_as_before(self):
+        events = [registered(), with_lease_policy(created(2)), assigned(3, 1), started(4, 1),
+                  registered(5, instance="alice-2")]
+        planned = plan(events)
+        self.assertEqual("worker process was replaced", planned["payload"]["reason"])
+        self.assertNotIn("released", planned["payload"])
 
     def test_a_stopped_worker_is_not_given_new_work(self):
         events = [registered(), with_lease_policy(created(2)), stopped(3)]
@@ -241,6 +328,121 @@ class AnnouncementTests(RuntimeTestCase):
         self.assertEqual("agent.stopped", topics(bus)[-1])
         self.assertEqual(0, runtime.exit_code)
 
+    def test_ctrl_c_with_work_running_says_stopping_first_and_stopped_last(self):
+        order = []
+        running = threading.Event()
+
+        class Bus(FakeBus):
+            def publish(self, topic, payload, **kwargs):
+                if topic in ("agent.stopping", "agent.stopped"):
+                    order.append(topic)
+                return super().publish(topic, payload, **kwargs)
+
+        class Executor:
+            def __init__(self):
+                self.released = threading.Event()
+
+            def execute(self, assignment):
+                running.set()
+                self.released.wait(5)
+                time.sleep(0.05)
+                order.append("executor returned")
+                return RetryableFailure("cancelled", "stopped")
+
+            def cancel(self, assignment_id):
+                order.append("cancel requested")
+                self.released.set()
+
+        bus = Bus()
+        runtime = self.runtime(bus, Executor())
+
+        def events():
+            yield assigned_event()
+            self.assertTrue(running.wait(2))
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.run(events())
+        self.assertEqual(["agent.stopping", "cancel requested", "executor returned",
+                          "agent.stopped"], order)
+        self.assertEqual({"name": "alice", "instance_id": "alice-1"},
+                         [e for e in bus.published if e["topic"] == "agent.stopping"][0]["payload"])
+        self.assertIs(True, stops(bus)[0]["payload"]["requested"])
+
+    def test_an_idle_worker_just_says_stopped(self):
+        bus = FakeBus()
+        runtime = self.runtime(bus)
+
+        def events():
+            raise KeyboardInterrupt
+            yield  # pragma: no cover
+
+        with self.assertRaises(KeyboardInterrupt):
+            runtime.run(events())
+        self.assertEqual(["agent.registered", "agent.stopped"], topics(bus))
+
+    def test_a_stuck_executor_cannot_keep_a_stopping_worker_alive(self):
+        # Ctrl-C, and the executor ignores cancellation. The worker used to
+        # go on heartbeating for as long as that call lasted, looking healthy
+        # and holding its task, while consuming no assignments.
+        release = threading.Event()
+        running = threading.Event()
+        observed = {}
+
+        class Stuck:
+            def execute(self, assignment):
+                running.set()
+                release.wait(10)
+                return Completed("far too late")
+
+        class Bus(FakeBus):
+            def __init__(self):
+                super().__init__()
+                self.beats = []
+
+            def publish(self, topic, payload, **kwargs):
+                if topic == "agent.heartbeat":
+                    self.beats.append(time.monotonic())
+                return super().publish(topic, payload, **kwargs)
+
+        bus = Bus()
+        runtime = self.runtime(bus, Stuck(), heartbeat_seconds=0.02)
+
+        def watch():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not stops(bus):
+                time.sleep(0.005)
+            announced = time.monotonic()
+            observed["topics"] = topics(bus)
+            observed["executor_still_stuck"] = not release.is_set()
+            time.sleep(0.3)
+            observed["beats_after_announcement"] = sum(beat > announced for beat in bus.beats)
+            release.set()
+
+        def events():
+            yield assigned_event()
+            self.assertTrue(running.wait(2))
+            threading.Thread(target=watch, daemon=True).start()
+            observed["interrupted"] = time.monotonic()
+            raise KeyboardInterrupt
+
+        with patch.object(runtime_module, "ATTEMPT_CANCEL_GRACE_SECONDS", 0.2):
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    runtime.run(events())
+            finally:
+                release.set()
+        self.assertTrue(observed["executor_still_stuck"])
+        self.assertEqual(["agent.stopping", "agent.stopped"],
+                         [topic for topic in observed["topics"] if topic.startswith("agent.stop")])
+        # It kept its lease alive while it waited for the executor, then let go.
+        self.assertTrue(any(beat > observed["interrupted"] for beat in bus.beats))
+        self.assertLessEqual(observed["beats_after_announcement"], 1)
+        self.assertIs(True, stops(bus)[0]["payload"]["requested"])
+        self.assertTrue(any("still running 0.2s after cancellation" in line
+                            for line in self.messages))
+        self.assertEqual([], [e for e in bus.published if e["topic"] == "task.completed"])
+
     def test_running_out_of_a_finite_event_list_is_not_a_stop(self):
         bus = FakeBus()
         self.runtime(bus).run(iter([assigned_event()]))
@@ -329,8 +531,10 @@ class AnnouncementTests(RuntimeTestCase):
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not stops(bus):
                 time.sleep(0.005)
-            # Announced before the executor let go, and after the failure.
-            self.assertEqual(["task.attempt_failed", "agent.stopped"], topics(bus)[-2:])
+            # Stopping first, so the retry is not sent back here; then the
+            # failure; then stopped, all before the executor let go.
+            self.assertEqual(["agent.stopping", "task.attempt_failed", "agent.stopped"],
+                             topics(bus)[-3:])
             self.assertIs(False, stops(bus)[0]["payload"]["requested"])
             release.set()
 

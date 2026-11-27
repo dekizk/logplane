@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
 from typing import Callable, Iterable, Optional, Union
 
 import httpx
@@ -40,9 +41,11 @@ ERROR_EXIT_CODE = 1
 # sends every stream a keepalive after 15s of sending it nothing, so this much
 # silence means the connection is gone.
 STREAM_READ_TIMEOUT_SECONDS = 30.0
-# How long an executor has to return after an attempt timeout asked it to
-# cancel. Past this the worker reports the timeout itself and stops, because
-# the slot that executor still occupies cannot be reclaimed.
+# How long an executor has to return after being told to cancel, by an
+# attempt timeout or by the worker stopping. Past this the worker stops
+# waiting for it: after an attempt timeout it reports the timeout itself and
+# retires, because the slot that executor still occupies cannot be reclaimed;
+# when stopping it lets go of its lease and announces the stop regardless.
 ATTEMPT_CANCEL_GRACE_SECONDS = 10.0
 # How long that worker keeps trying to deliver the timeout report before it
 # stops anyway and leaves the task to its lease.
@@ -202,6 +205,7 @@ class WorkerRuntime:
         self._abandoned: set[str] = set()
         self._registered = False
         self._stop_announced = False
+        self._stopping_announced = False
         self._paused_task_ids: set[int] = set()
         self._paused_correlations: set[str] = set()
         # Admission is derived from the same ordered history as the PM. This
@@ -239,6 +243,36 @@ class WorkerRuntime:
             self.stopped_by_disconnect = True
         else:
             self._failure_exit_code = ERROR_EXIT_CODE
+
+    def _announce_stopping(self) -> None:
+        """Tell the coordinator to send this process nothing more. Best effort, once.
+
+        Said as soon as the worker knows it is going while work is still
+        running. The lease on that work stays alive, so nothing is handed to
+        another worker while its executors may still be busy; but the
+        coordinator stops choosing this worker for new assignments, which it
+        would no longer pick up.
+        """
+        with self._lock:
+            if (
+                self._stopping_announced
+                or self._stop_announced
+                or not self._registered
+                or self.stopped_by_disconnect
+            ):
+                return
+            self._stopping_announced = True
+        try:
+            self.bus.publish(
+                "agent.stopping",
+                {"name": self.name, "instance_id": self.instance_id},
+                idempotency_key=f"stopping:{self.instance_id}",
+            )
+        except Exception as exc:
+            self.log(
+                f"[{self.name}] could not announce that it is stopping "
+                f"({exc.__class__.__name__})"
+            )
 
     def _announce_stop(self) -> None:
         """Tell the coordinator this process has stopped. Best effort, once.
@@ -709,27 +743,52 @@ class WorkerRuntime:
             self._closed = True
             self._accepting = False
             assignment_ids = tuple(self._owned)
+            running = [future for future in self._futures.values() if not future.done()]
+            stop_announced = self._stop_announced
         if not drain:
             self.stop_event.set()
+            if running:
+                # Before anything else: the coordinator should stop choosing
+                # this worker now, not when the executors have finished.
+                self._announce_stopping()
             for assignment_id in assignment_ids:
                 self._revoke(assignment_id)
             self._close_executor()
+            if running and not stop_announced:
+                # Give cancelled executors time to stop before the work is
+                # handed on, so two agents are not doing it at once. Not for
+                # ever: one that ignores cancellation must not keep this
+                # worker looking alive, and holding its tasks, indefinitely.
+                _, still_running = wait_for_futures(
+                    running, timeout=ATTEMPT_CANCEL_GRACE_SECONDS
+                )
+                if still_running:
+                    self.log(
+                        f"[{self.name}] {len(still_running)} executor call(s) still "
+                        f"running {ATTEMPT_CANCEL_GRACE_SECONDS:g}s after cancellation; "
+                        "announcing the stop anyway. This process cannot exit "
+                        "until they return."
+                    )
+            self._stop_heartbeat()
+            self._announce_stop()
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=not drain)
         if drain:
             self._close_executor()
         self.stop_event.set()
+        self._stop_heartbeat()
+        # A finite event iterable simply running out (embedding and tests) is
+        # not announced: everything accepted was finished, so there is nothing
+        # to hand back. A failure while draining is still a stop.
+        if drain and self.exit_code != 0:
+            self._announce_stop()
+
+    def _stop_heartbeat(self) -> None:
         self._heartbeat_stop.set()
         self._write_confirmed()
-        if self._heartbeat is not None:
-            self._heartbeat.join(timeout=max(1.0, self.heartbeat_seconds + 0.5))
-        # Last, once every executor has returned: the coordinator may hand the
-        # work to another worker the moment it hears this. Not after a finite
-        # event iterable has simply run out (embedding and tests): everything
-        # accepted was finished, so there is nothing to hand back. A failure
-        # while draining is still a stop.
-        if not drain or self.exit_code != 0:
-            self._announce_stop()
+        heartbeat = self._heartbeat
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join(timeout=max(1.0, self.heartbeat_seconds + 0.5))
 
     def _write_failed(self) -> None:
         """Arm once per outage. Further failures never extend the window."""
@@ -1016,6 +1075,8 @@ class WorkerRuntime:
             self._abandoned.add(assignment_id)
             self._accepting = False
         self._heartbeat_stop.set()
+        # First, so the retry of this very task is not sent back here.
+        self._announce_stopping()
         self.log(
             f"[{self.name}] executor did not stop within "
             f"{ATTEMPT_CANCEL_GRACE_SECONDS:g}s of cancellation: {assignment_id}; "

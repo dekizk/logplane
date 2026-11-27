@@ -1125,6 +1125,7 @@ _PAYLOAD_VALIDATORS: dict[str, Validator] = {
     "integration.task_observed": _task_observed,
     "agent.registered": _agent_presence,
     "agent.heartbeat": _agent_presence,
+    "agent.stopping": _agent_presence,
     "agent.stopped": _agent_presence,
     "agent.policy_set": _agent_policy_set,
     "workflow.pause_requested": _workflow_control_requested,
