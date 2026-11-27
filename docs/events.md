@@ -88,8 +88,12 @@ earlier releases still replays:
   waiting for the lease, with `released: true` when the stop was requested or
   the attempt had not started. That holds even if the name has registered
   again in the meantime. A released expiry is not charged to the task's lease
-  policy or retry budget. Histories without these replay unchanged, and a PM
-  that predates them ignores both events and falls back to the lease.
+  policy or retry budget. The PM also sets `released: true` when it expires
+  an assignment that was recorded after its worker had already been replaced
+  and that never started: the process it names was gone before it existed.
+  The assignment itself is still accepted by the reducer, as in earlier
+  releases, so histories written by them replay as they were written. A PM
+  that predates the stop events ignores them and falls back to the lease.
 - The optional `payload.retry_after_seconds` on a retryable
   `task.attempt_failed` (after v0.14.1): a positive number of at most 604,800
   that delays the next assignment until that long after the event. Failures

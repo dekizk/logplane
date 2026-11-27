@@ -5,14 +5,19 @@
 - **A worker stopped on purpose hands its work back at once.** A worker
   stopped with Ctrl-C or `SIGTERM` now publishes `agent.stopping` if it has
   work running, so it is sent nothing more, cancels its attempts, and
-  publishes `agent.stopped` once its executors have returned. The coordinator
+  publishes `agent.stopped` when cleanup finishes or its grace period ends.
+  The coordinator
   reassigns the work as soon as it reads that, and does not count it against
   the task's lost-worker allowance or retry budget, even if the worker has
   already been started again under the same name. Before, the work waited for
   the lease to run out (20 seconds by default, and for as long as a cancelled
   executor took to finish) and each stop used one of the task's three lost
-  workers. An executor that ignores cancellation holds the hand-back up for
-  at most 10 seconds. `task.assignment_expired` gains an optional `released`
+  workers. The executor and its cancel/close hooks share a single 10-second
+  grace period. An assignment recorded after its worker had already been
+  replaced is handed back without spending an allowance; an unexpected stream
+  error is not a requested stop. `WorkerRuntime.stop()` now returns at once
+  and does the hand-back in the background, so it no longer waits for
+  executors. `task.assignment_expired` gains an optional `released`
   flag, `logplane workers` shows `stopping` and `stopped`, and
   `WorkerRuntime.run()` now treats `SIGTERM` like Ctrl-C when no other handler
   is installed. A worker that is killed outright is still recovered by its

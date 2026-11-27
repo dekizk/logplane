@@ -294,16 +294,27 @@ workers" and the retry budget are untouched. `logplane workers` shows the
 worker as `stopping` and then `stopped`, and it is given no new work until a
 new process registers under the name. Starting the worker again straight away
 is safe: the hand-back is remembered against the work the old process held,
-not against the name.
+not against the name. An assignment to the old process that is recorded only
+after its replacement registered is handed back at once and spends no
+allowance either.
 
-The wait for executors is limited to 10 seconds. An executor that ignores
-cancellation for longer does not keep the worker looking alive: the worker
-stops heartbeating and publishes `agent.stopped` anyway, and the work moves
-on. The old call may then still be running alongside the new attempt, and the
-process cannot exit until it returns.
+The executor and its adapter's `cancel()` and `close()` hooks share one
+10-second grace period. An executor or hook that ignores cancellation for
+longer does not keep the worker looking alive: the worker stops heartbeating
+and publishes `agent.stopped` anyway, and the work moves on. The old call may
+then still be running alongside the new attempt, and the process cannot exit
+until it returns.
 
-A worker that stops itself over a failure (see the exit statuses below)
-announces the stop in the same way, so its work is also handed back at once,
+Code that embeds `WorkerRuntime` can call `runtime.stop()` from any thread for
+the same orderly stop. It returns immediately: cancelling the executors, the
+wait for them and the announcements happen in the background, so the work is
+handed back even if the event stream is quiet. Executors may therefore still
+be running when `stop()` returns; `run()` returning is what says they have
+stopped or been given up on.
+
+A worker that stops itself over a failure, including an unexpected
+event-stream error, announces the stop as `requested: false` if the bus is
+reachable. Its work is also handed back at once,
 but an attempt it had already started counts as a lost worker; one it had not
 started never does. If the announcements cannot be delivered, or the worker
 is killed outright (`SIGKILL`, a crash, a power cut), nothing is announced

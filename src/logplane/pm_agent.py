@@ -469,6 +469,17 @@ def plan_next_emission(
             reason = "worker is no longer registered"
         elif worker.instance_id != task.worker_instance_id:
             reason = "worker process was replaced"
+            # A registration can land between planning an assignment and
+            # recording it. The process it names was already gone by then,
+            # so it never ran and nothing was lost. This is decided here, on
+            # the expiry, and not by refusing the assignment in the reducer:
+            # earlier releases recorded such assignments as owned and charged
+            # for them, and that history has to replay as it was written.
+            released = (
+                task.status == "assigned"
+                and task.assignment_event_id is not None
+                and worker.registered_event_id < task.assignment_event_id
+            )
         elif now - worker.last_seen > lease_seconds:
             if hold_lease_expiry:
                 continue

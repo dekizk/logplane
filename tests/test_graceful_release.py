@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import httpx
 
+from logplane.client import BusProtocolError
 from logplane.event_validation import EventValidationError, validate_event
 from logplane.executors import Completed, RetryableFailure
 from logplane.operations import explain_task, worker_views
@@ -211,6 +212,60 @@ class HandBackTests(unittest.TestCase):
         self.assertNotIn("released", planned["payload"])
         self.assertEqual("lease_expiry_limit_exhausted",
                          plan(record(events, planned))["payload"]["reason_code"])
+
+    def test_an_assignment_recorded_after_its_worker_was_replaced_is_released(self):
+        # The coordinator chose alice-1; before that assignment was recorded,
+        # alice-1 stopped and alice-2 registered. Nothing ran, so nothing is
+        # charged, even for a task with no allowance at all.
+        events = [registered(), with_lease_policy(created(2), 0)]
+        delivery = plan(events)
+        self.assertEqual("alice-1", delivery["payload"]["worker_instance_id"])
+        events = record(events + [stopped(3), registered(4, instance="alice-2")], delivery)
+        planned = plan(events)
+        self.assertEqual(("task.assignment_expired", "worker process was replaced", True),
+                         (planned["topic"], planned["payload"]["reason"],
+                          planned["payload"].get("released")))
+        events = record(events, planned)
+        task = replay_events(events).tasks[1]
+        self.assertEqual(("open", 0, 0), (task.status, task.retryable_failures, task.lease_expiries))
+        replacement = plan(events)
+        self.assertEqual(("task.assigned", "alice-2", 2), (
+            replacement["topic"], replacement["payload"]["worker_instance_id"],
+            replacement["payload"]["attempt"]))
+        self.assertEqual("assigned", replay_events(record(events, replacement)).tasks[1].status)
+
+    def test_a_replaced_worker_is_still_charged_for_work_it_could_have_run(self):
+        # Assigned before the replacement registered: the old process may have
+        # been running it, started or not.
+        for begun in (False, True):
+            with self.subTest(begun=begun):
+                events = [registered(), with_lease_policy(created(2)), assigned(3, 1)]
+                events += [started(4, 1)] if begun else []
+                events.append(registered(5, instance="alice-2"))
+                planned = plan(events)
+                self.assertEqual("worker process was replaced", planned["payload"]["reason"])
+                self.assertNotIn("released", planned["payload"])
+        # ...and for work it did start, however the assignment was ordered.
+        events = [registered(), with_lease_policy(created(2)), registered(3, instance="alice-2"),
+                  assigned(4, 1), started(5, 1)]
+        self.assertNotIn("released", plan(events)["payload"])
+
+    def test_a_history_from_an_earlier_release_replays_as_it_was_written(self):
+        # An earlier release recorded this: an assignment to a process that
+        # had just been replaced, its expiry charged to the task's only retry,
+        # and the task failed. Replaying it must not bring the task back.
+        events = [registered(), created(2, max_retries=0), registered(3, instance="alice-2"),
+                  assigned(4, 1), event(5, "task.assignment_expired", "pm", {
+                      "task_id": 1, "assignment_id": "task:1:attempt:1", "assignee": "alice",
+                      "worker_instance_id": "alice-1", "reason": "worker process was replaced"})]
+        task = replay_events(events).tasks[1]
+        self.assertEqual(("open", 1), (task.status, task.retryable_failures))
+        failure = plan(events)
+        self.assertEqual(("task.failed", "retry_budget_exhausted"),
+                         (failure["topic"], failure["payload"]["reason_code"]))
+        events = record(events, failure)
+        self.assertEqual("failed", replay_events(events).tasks[1].status)
+        self.assertIsNone(plan(events))
 
     def test_an_assignment_planned_before_the_stop_was_read_is_released(self):
         # The coordinator had not yet read the stop when it chose this worker.
@@ -443,10 +498,133 @@ class AnnouncementTests(RuntimeTestCase):
                             for line in self.messages))
         self.assertEqual([], [e for e in bus.published if e["topic"] == "task.completed"])
 
+    def test_a_stop_requested_before_the_worker_runs_is_still_announced(self):
+        executed = []
+
+        class Executor:
+            def execute(self, assignment):
+                executed.append(assignment.assignment_id)
+                return Completed("done")
+
+        bus = FakeBus()
+        runtime = self.runtime(bus, Executor())
+        runtime.stop()
+        runtime.stop()
+        runtime.run(iter([assigned_event()]))
+        # It registers, sees the request, takes nothing and says it stopped,
+        # so the coordinator is not left with a healthy-looking worker.
+        self.assertEqual(["agent.registered", "agent.stopped"], topics(bus))
+        self.assertEqual([], executed)
+        self.assertIs(True, stops(bus)[0]["payload"]["requested"])
+        self.assertEqual(0, runtime.exit_code)
+
     def test_running_out_of_a_finite_event_list_is_not_a_stop(self):
         bus = FakeBus()
-        self.runtime(bus).run(iter([assigned_event()]))
+        runtime = self.runtime(bus)
+        runtime.run(iter([assigned_event()]))
+        runtime.stop()  # An embedding application's final cleanup is a no-op.
         self.assertEqual(["agent.registered", "task.started", "task.completed"], topics(bus))
+
+    def test_stream_error_with_a_running_task_is_not_a_requested_release(self):
+        running, release = threading.Event(), threading.Event()
+
+        class Executor:
+            def execute(self, assignment):
+                running.set()
+                release.wait(3)
+                return Completed("late")
+
+            def cancel(self, assignment_id):
+                release.set()
+
+        bus = FakeBus()
+        runtime = self.runtime(bus, Executor())
+        error = BusProtocolError("invalid JSON in event stream")
+
+        def events():
+            yield assigned_event()
+            self.assertTrue(running.wait(2))
+            raise error
+
+        with self.assertRaises(BusProtocolError) as caught:
+            runtime.run(events())
+        self.assertIs(error, caught.exception)
+        self.assertEqual(ERROR_EXIT_CODE, runtime.exit_code)
+        announcement, = stops(bus)
+        self.assertFalse(announcement["payload"]["requested"])
+        self.assertNotIn("task.completed", topics(bus))
+
+    def test_a_blocked_cancel_or_close_hook_cannot_hold_the_lease(self):
+        # One call per case. Sharing one function's locals let a thread left
+        # over from the first case set the second case's events.
+        for hook in ("cancel", "close"):
+            with self.subTest(hook=hook):
+                self._blocked_hook_cannot_hold_the_lease(hook)
+
+    def _blocked_hook_cannot_hold_the_lease(self, hook):
+        running, in_hook = threading.Event(), threading.Event()
+        unblock, announced = threading.Event(), threading.Event()
+        finished = threading.Event()
+
+        class Executor:
+            def execute(self, assignment):
+                running.set()
+                finished.wait(4)
+                return Completed("late")
+
+            def block(self):
+                in_hook.set()
+                unblock.wait(4)
+
+            def cancel(self, assignment_id):
+                if hook == "cancel":
+                    self.block()
+                finished.set()
+
+            def close(self):
+                if hook == "close":
+                    self.block()
+
+        class Bus(FakeBus):
+            def publish(self, topic, payload, **kwargs):
+                result = super().publish(topic, payload, **kwargs)
+                if topic == "agent.stopped":
+                    announced.set()
+                return result
+
+        bus = Bus()
+        runtime = self.runtime(bus, Executor(), heartbeat_seconds=0.02)
+
+        def events():
+            yield assigned_event()
+            running.wait(2)
+            raise KeyboardInterrupt
+
+        def run():
+            try:
+                runtime.run(events())
+            except KeyboardInterrupt:
+                pass
+
+        thread = threading.Thread(target=run)
+        with patch.object(runtime_module, "ATTEMPT_CANCEL_GRACE_SECONDS", 0.1):
+            thread.start()
+            try:
+                self.assertTrue(in_hook.wait(2))
+                self.assertTrue(announced.wait(1), f"{hook} held the lease")
+                self.assertTrue(runtime._heartbeat_stop.is_set())
+                if hook == "close":
+                    thread.join(1)
+                    self.assertFalse(thread.is_alive(), "close held the runtime open")
+            finally:
+                unblock.set()
+                finished.set()
+                thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(["agent.stopping", "agent.stopped"],
+                         [topic for topic in topics(bus) if topic.startswith("agent.stop")])
+        self.assertTrue(stops(bus)[0]["payload"]["requested"])
+        self.assertNotIn("task.completed", topics(bus))
 
     def test_a_replaced_worker_does_not_announce_what_the_coordinator_already_knows(self):
         bus = FakeBus()

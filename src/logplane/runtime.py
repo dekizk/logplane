@@ -193,6 +193,8 @@ class WorkerRuntime:
         self._heartbeat_stop = threading.Event()
         self._lock = threading.Lock()
         self._executor_control_lock = threading.Lock()
+        self._executor_closed = False
+        self._release_thread: Optional[threading.Thread] = None
         self._owned: set[str] = set()
         self._seen_assignment_ids: set[str] = set()
         self._assignment_phases: dict[str, str] = {}
@@ -401,6 +403,12 @@ class WorkerRuntime:
                     # admission/dependency error has already stopped us.
                     break
             completed_normally = not self.stop_event.is_set()
+        except Exception as exc:
+            # An unhandled stream/dispatch error is not an operator stop.
+            # Record the cause before shutdown publishes the disposition.
+            # KeyboardInterrupt (also used for SIGTERM) bypasses this handler.
+            self._stopping_on_failure(exc)
+            raise
         finally:
             try:
                 self.shutdown(drain=completed_normally)
@@ -728,13 +736,80 @@ class WorkerRuntime:
         return resolved
 
     def stop(self) -> None:
-        self.stop_event.set()
-        self._heartbeat_stop.set()
+        """Ask the worker to stop. Returns at once; safe from any thread.
+
+        No more work is accepted from this call on. Cancelling what is
+        running, the wait for it, and the announcements to the coordinator
+        happen on a background thread, so the work is handed back even if the
+        caller, the event stream or an executor hook is blocked. Heartbeats
+        continue until that is done (at most ATTEMPT_CANCEL_GRACE_SECONDS), so
+        a caller must not assume executors have stopped when this returns:
+        run() returning is what says so.
+        """
         with self._lock:
-            assignment_ids = tuple(self._owned)
+            if self._closed and not self._registered:
+                return  # A finished finite run has nothing left to hand back.
+            if not self._registered:
+                # Not running yet, so there is nothing to release. Leave the
+                # hand-back to run(), which will register, see this and stop;
+                # spending it here would leave that registration unannounced.
+                self.stop_event.set()
+                self._accepting = False
+                return
+        self._begin_release()
+
+    def _begin_release(self) -> threading.Thread:
+        # stop() may race run()'s finally block or be called by an adapter
+        # hook. Give the handoff a single owner; never join it from stop().
+        with self._lock:
+            self.stop_event.set()
             self._accepting = False
+            if self._release_thread is None:
+                self._release_thread = threading.Thread(
+                    target=self._release_work,
+                    args=(tuple(self._owned), tuple(self._futures.values()),
+                          time.monotonic() + ATTEMPT_CANCEL_GRACE_SECONDS),
+                    name=f"{self.name}-release", daemon=True,
+                )
+                self._release_thread.start()
+            return self._release_thread
+
+    def _cleanup_executor(self, assignment_ids: tuple[str, ...]) -> None:
         for assignment_id in assignment_ids:
             self._revoke(assignment_id)
+        try:
+            self._close_executor()
+        except Exception as exc:
+            self.log(f"[{self.name}] executor cleanup failed ({exc.__class__.__name__}): {exc}")
+
+    def _release_work(
+        self, assignment_ids: tuple[str, ...], futures: tuple[Future, ...], deadline: float
+    ) -> None:
+        try:
+            if any(not future.done() for future in futures):
+                self._announce_stopping()
+            else:
+                # No execution to protect: an idle adapter's close() must not
+                # leave the worker eligible for new assignments.
+                self._heartbeat_stop.set()
+                self._announce_stop()
+            # cancel() and close() are adapter code. Keep them serialized, but
+            # never let either own the clock that decides when the lease ends.
+            cleanup = threading.Thread(target=self._cleanup_executor, args=(assignment_ids,),
+                                       name=f"{self.name}-cleanup", daemon=True)
+            cleanup.start()
+            cleanup.join(max(0.0, deadline - time.monotonic()))
+            running = [future for future in futures if not future.done()]
+            if running:
+                wait_for_futures(running, timeout=max(0.0, deadline - time.monotonic()))
+            if cleanup.is_alive() or any(not future.done() for future in running):
+                self.log(
+                    f"[{self.name}] executor or cleanup hook still running "
+                    f"{ATTEMPT_CANCEL_GRACE_SECONDS:g}s after cancellation; announcing the stop anyway"
+                )
+        finally:
+            self._heartbeat_stop.set()
+            self._announce_stop()  # Idempotent, including the idle path above.
 
     def shutdown(self, *, drain: bool = False) -> None:
         with self._lock:
@@ -742,39 +817,15 @@ class WorkerRuntime:
                 return
             self._closed = True
             self._accepting = False
-            assignment_ids = tuple(self._owned)
-            running = [future for future in self._futures.values() if not future.done()]
-            stop_announced = self._stop_announced
         if not drain:
-            self.stop_event.set()
-            if running:
-                # Before anything else: the coordinator should stop choosing
-                # this worker now, not when the executors have finished.
-                self._announce_stopping()
-            for assignment_id in assignment_ids:
-                self._revoke(assignment_id)
-            self._close_executor()
-            if running and not stop_announced:
-                # Give cancelled executors time to stop before the work is
-                # handed on, so two agents are not doing it at once. Not for
-                # ever: one that ignores cancellation must not keep this
-                # worker looking alive, and holding its tasks, indefinitely.
-                _, still_running = wait_for_futures(
-                    running, timeout=ATTEMPT_CANCEL_GRACE_SECONDS
-                )
-                if still_running:
-                    self.log(
-                        f"[{self.name}] {len(still_running)} executor call(s) still "
-                        f"running {ATTEMPT_CANCEL_GRACE_SECONDS:g}s after cancellation; "
-                        "announcing the stop anyway. This process cannot exit "
-                        "until they return."
-                    )
-            self._stop_heartbeat()
-            self._announce_stop()
+            self._begin_release().join()
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=not drain)
         if drain:
-            self._close_executor()
+            if self.stop_event.is_set():
+                self._begin_release().join()
+            else:
+                self._close_executor()
         self.stop_event.set()
         self._stop_heartbeat()
         # A finite event iterable simply running out (embedding and tests) is
@@ -782,6 +833,8 @@ class WorkerRuntime:
         # to hand back. A failure while draining is still a stop.
         if drain and self.exit_code != 0:
             self._announce_stop()
+        with self._lock:
+            self._registered = False
 
     def _stop_heartbeat(self) -> None:
         self._heartbeat_stop.set()
@@ -1099,9 +1152,6 @@ class WorkerRuntime:
             self._abandoned.discard(assignment_id)
         self._stopping_on_failure()
         self.stop()
-        # shutdown() cannot get as far as announcing while that executor is
-        # stuck, so say so now, or the retry may come straight back here.
-        self._announce_stop()
 
     def _publish_while_owned(
         self,
@@ -1239,4 +1289,7 @@ class WorkerRuntime:
         close = getattr(self.executor, "close", None)
         if callable(close):
             with self._executor_control_lock:
+                if self._executor_closed:
+                    return
+                self._executor_closed = True
                 close()
