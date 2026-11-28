@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **A worker stopped on purpose hands its work back at once.** A worker
+  stopped with Ctrl-C or `SIGTERM` now publishes `agent.stopping` if it has
+  work running, so it is sent nothing more, cancels its attempts, and
+  publishes `agent.stopped` when cleanup finishes or its grace period ends.
+  The coordinator
+  reassigns the work as soon as it reads that, and does not count it against
+  the task's lost-worker allowance or retry budget, even if the worker has
+  already been started again under the same name. Before, the work waited for
+  the lease to run out (20 seconds by default, and for as long as a cancelled
+  executor took to finish) and each stop used one of the task's three lost
+  workers. The executor and its cancel/close hooks share a single 10-second
+  grace period. An assignment recorded after its worker had already been
+  replaced is handed back without spending an allowance; an unexpected stream
+  error is not a requested stop. `WorkerRuntime.stop()` now returns at once
+  and does the hand-back in the background, so it no longer waits for
+  executors. `task.assignment_expired` gains an optional `released`
+  flag, `logplane workers` shows `stopping` and `stopped`, and
+  `WorkerRuntime.run()` now treats `SIGTERM` like Ctrl-C when no other handler
+  is installed. A worker that is killed outright is still recovered by its
+  lease, as before.
+
+- **A worker can limit how long one attempt runs.** Off by default.
+  `logplane demo-worker --attempt-timeout SECONDS`, or
+  `WorkerRuntime(attempt_timeout_seconds=...)`, cancels an attempt that has
+  been executing that long and reports it as a retryable `attempt_timeout`
+  failure, so a hung agent no longer holds its task and worker for as long as
+  the worker keeps heartbeating. It is for executors with no limit of their
+  own; the example workers and the CLI and HTTP adapters already have one. A
+  worker whose executor ignores cancellation for 10 seconds retires: it takes
+  no more work, stops renewing its lease, reports the timeout if it can, and
+  stops with exit status 1. The demo worker's executor now honours
+  cancellation, so the demo worker also stops promptly.
+- **The subprocess executor stops the whole process tree.** On POSIX,
+  `SubprocessExecutor` and the CLI adapter run the command in its own session
+  and stop its process group whenever an attempt ends: exit, timeout,
+  cancellation, oversized output or shutdown. Processes the command started
+  used to keep running after a timeout or cancellation, and could hold the
+  output pipes open after a normal exit. A command that deliberately left a
+  background process running will now have it stopped. The timeout now also
+  covers writing the assignment to the command: one that never read a large
+  input used to block the worker before the timeout had started.
+
 - **A worker can give up on a bus that stays unreachable.** Off by default.
   Set `LOGPLANE_WORKER_DISCONNECT_TIMEOUT_SECONDS` in the worker's
   environment, or pass `disconnect_timeout_seconds` to `WorkerRuntime`, and a

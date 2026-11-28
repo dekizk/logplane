@@ -101,6 +101,27 @@ class DemoWorkerFlagTests(unittest.TestCase):
             self.assertEqual(2, code)
             self.assertIn("LOGPLANE_HEARTBEAT_SECONDS must be a positive number", stderr)
 
+    def test_attempt_timeout_flag_reaches_the_runtime(self):
+        parser = logplane_cli.build_parser()
+        for invalid in ("0", "-5", "inf", "nan"):
+            with self.subTest(invalid=invalid), patch("sys.stderr", io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                parser.parse_args(["demo-worker", "alice", "--attempt-timeout", invalid])
+        with tempfile.TemporaryDirectory() as directory:
+            config = str(initialize_local_config(directory))
+            for extra, expected in ((["--attempt-timeout", "45"], 45.0), ([], None)):
+                with (
+                    self.subTest(extra=extra),
+                    patch("logplane.client.BusClient"),
+                    patch("logplane.runtime.WorkerRuntime") as runtime_class,
+                ):
+                    runtime_class.return_value.exit_code = 0
+                    code, _, stderr = run(["demo-worker", "alice", "--config", config, *extra])
+                    self.assertEqual(0, code, stderr)
+                    self.assertEqual(
+                        expected, runtime_class.call_args.kwargs["attempt_timeout_seconds"]
+                    )
+
     def test_default_delay_matches_previous_behaviour(self):
         self.assertEqual(0.5, worker.DemoExecutor("alice").delay_seconds)
         with self.assertRaises(ValueError):

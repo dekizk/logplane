@@ -455,10 +455,31 @@ def plan_next_emission(
         if task.status not in ACTIVE_TASK_STATUSES or task.assignment_id is None:
             continue
         worker = state.workers.get(task.assignee or "")
-        if worker is None:
+        released = False
+        if task.assignee_stop_requested is not None:
+            # The process holding it said it had stopped, so there is nothing
+            # to wait for and no outage to allow for: hold_lease_expiry does
+            # not apply. Checked first, and from the task: by now the name may
+            # have registered again, which is not the worker being lost.
+            reason = "worker stopped"
+            # Not charged to the task when the worker was asked to stop, or
+            # when the attempt never started and so cannot be why it stopped.
+            released = task.assignee_stop_requested or task.status == "assigned"
+        elif worker is None:
             reason = "worker is no longer registered"
         elif worker.instance_id != task.worker_instance_id:
             reason = "worker process was replaced"
+            # A registration can land between planning an assignment and
+            # recording it. The process it names was already gone by then,
+            # so it never ran and nothing was lost. This is decided here, on
+            # the expiry, and not by refusing the assignment in the reducer:
+            # earlier releases recorded such assignments as owned and charged
+            # for them, and that history has to replay as it was written.
+            released = (
+                task.status == "assigned"
+                and task.assignment_event_id is not None
+                and worker.registered_event_id < task.assignment_event_id
+            )
         elif now - worker.last_seen > lease_seconds:
             if hold_lease_expiry:
                 continue
@@ -473,6 +494,7 @@ def plan_next_emission(
                 "assignee": task.assignee,
                 "worker_instance_id": task.worker_instance_id,
                 "reason": reason,
+                **({"released": True} if released else {}),
             },
             "caused_by": task.assignment_event_id,
             "idempotency_key": f"expire:{task.assignment_id}",

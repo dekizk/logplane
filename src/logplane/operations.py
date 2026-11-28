@@ -112,7 +112,11 @@ def worker_views(
             {
                 "name": worker.name,
                 "instance_id": worker.instance_id,
-                "status": "healthy" if lease_age <= lease_seconds else "stale",
+                "status": (
+                    "stopped" if worker.stopped_event_id is not None
+                    else "stopping" if worker.stopping_event_id is not None
+                    else "healthy" if lease_age <= lease_seconds else "stale"
+                ),
                 "lease_age_seconds": round(lease_age, 3),
                 "lease_seconds": lease_seconds,
                 "capacity": worker.capacity,
@@ -297,6 +301,12 @@ def explain_task(
         evidence.append(task.assignment_previous_event_id)
         evidence.append(task.assignment_agent_policy_event_id)
         worker = state.workers.get(task.assignee or "")
+        if task.assignee_stop_requested is not None:
+            return _explanation(
+                "active_worker_stopped",
+                f"Attempt {task.assignment_id} was held by {task.assignee}, which has stopped; the PM has not yet handed it back.",
+                evidence,
+            )
         if worker is None:
             return _explanation(
                 "active_worker_missing",

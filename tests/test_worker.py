@@ -1,5 +1,7 @@
 import unittest
 import io
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,14 +36,33 @@ class DemoExecutorTests(unittest.TestCase):
             block_once=1,
             fail_once=2,
             fail_permanently_once=3,
+            delay_seconds=0,
         )
-        with patch("logplane.worker.time.sleep", return_value=None):
-            self.assertIsInstance(executor.execute(assignment(1)), Blocked)
-            self.assertIsInstance(executor.execute(assignment(1)), Completed)
-            self.assertIsInstance(executor.execute(assignment(2)), RetryableFailure)
-            self.assertIsInstance(executor.execute(assignment(2)), Completed)
-            self.assertIsInstance(executor.execute(assignment(3)), PermanentFailure)
-            self.assertIsInstance(executor.execute(assignment(3)), Completed)
+        self.assertIsInstance(executor.execute(assignment(1)), Blocked)
+        self.assertIsInstance(executor.execute(assignment(1)), Completed)
+        self.assertIsInstance(executor.execute(assignment(2)), RetryableFailure)
+        self.assertIsInstance(executor.execute(assignment(2)), Completed)
+        self.assertIsInstance(executor.execute(assignment(3)), PermanentFailure)
+        self.assertIsInstance(executor.execute(assignment(3)), Completed)
+
+    def test_demo_executor_stops_waiting_when_cancelled(self):
+        executor = worker.DemoExecutor("alice", delay_seconds=30)
+        results = []
+        thread = threading.Thread(target=lambda: results.append(executor.execute(assignment(1))))
+        thread.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not executor._cancelled:
+            time.sleep(0.005)
+        executor.cancel("task:9:attempt:1")  # someone else's attempt: ignored
+        executor.cancel("task:1:attempt:1")
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual("demo_cancelled", results[0].code)
+        self.assertEqual({}, executor._cancelled)
+        # Cancelling one attempt does not poison the next.
+        quick = worker.DemoExecutor("alice", delay_seconds=0)
+        quick.cancel("task:1:attempt:1")
+        self.assertIsInstance(quick.execute(assignment(1)), Completed)
 
 
 class WorkerMainTests(unittest.TestCase):
@@ -54,6 +75,7 @@ class WorkerMainTests(unittest.TestCase):
             fail=4,
             fail_permanently=None,
             delay=0.5,
+            attempt_timeout=90.0,
         )
         fake_bus = Mock()
         fake_runtime = Mock(exit_code=0)
@@ -70,13 +92,15 @@ class WorkerMainTests(unittest.TestCase):
         kwargs = runtime_class.call_args.kwargs
         self.assertEqual("alice", kwargs["name"])
         self.assertEqual(2, kwargs["capacity"])
+        self.assertEqual(90.0, kwargs["attempt_timeout_seconds"])
         self.assertEqual(["python"], kwargs["capabilities"])
         self.assertIsInstance(kwargs["executor"], worker.DemoExecutor)
         fake_runtime.run.assert_called_once_with()
 
     def test_main_exits_with_the_runtime_status_after_a_disconnect_stop(self):
         args = SimpleNamespace(name="alice", capacity=1, capabilities=[], block=None,
-                               fail=None, fail_permanently=None, delay=0.5)
+                               fail=None, fail_permanently=None, delay=0.5,
+                               attempt_timeout=None)
         with (
             patch("logplane.worker.parse_args", return_value=args),
             patch("logplane.client.BusClient"),

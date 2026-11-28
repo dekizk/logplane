@@ -3,7 +3,6 @@
 import argparse
 import os
 import threading
-import time
 
 from logplane.legacy import check_legacy_environment
 from logplane.executors import (
@@ -57,11 +56,26 @@ class DemoExecutor:
         self.fail_once = fail_once
         self.fail_permanently_once = fail_permanently_once
         self._lock = threading.Lock()
+        self._cancelled: dict[str, threading.Event] = {}
 
     def execute(self, assignment: AssignmentContext):
         # Replace this body with a real agent implementation. The surrounding
         # runtime already owns registration, leases, concurrency, and events.
-        time.sleep(self.delay_seconds)
+        cancelled = threading.Event()
+        with self._lock:
+            self._cancelled[assignment.assignment_id] = cancelled
+        try:
+            # The simulated work. A real agent should give up just as promptly
+            # when cancel() is called: that is what lets the runtime stop a
+            # revoked, timed-out or shut-down attempt and reuse the slot.
+            if cancelled.wait(self.delay_seconds):
+                return RetryableFailure(
+                    "demo_cancelled",
+                    "demo worker was told to stop this task",
+                )
+        finally:
+            with self._lock:
+                self._cancelled.pop(assignment.assignment_id, None)
         with self._lock:
             if self.fail_once == assignment.task_id:
                 self.fail_once = None
@@ -81,6 +95,12 @@ class DemoExecutor:
         return Completed(
             summary=f"{self.name} finished: {assignment.goal}",
         )
+
+    def cancel(self, assignment_id: str) -> None:
+        with self._lock:
+            cancelled = self._cancelled.get(assignment_id)
+        if cancelled is not None:
+            cancelled.set()
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -114,6 +134,7 @@ def run_demo_worker(args: argparse.Namespace, *, bus_url: str,
         capacity=args.capacity,
         capabilities=args.capabilities,
         heartbeat_seconds=heartbeat_seconds,
+        attempt_timeout_seconds=args.attempt_timeout,
     )
     runtime.run()
     return runtime.exit_code

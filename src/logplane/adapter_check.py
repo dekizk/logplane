@@ -176,8 +176,14 @@ def _child(args) -> None:
     # All adapter-controlled hooks, including imports and constructors, stay
     # within this process and therefore within the parent's deadline.
     from logplane.conformance import check_executor
+    from logplane.executors import share_process_group_with_commands
     from logplane.integration import IntegrationConfig, PythonAgentAdapter, load_python_target
 
+    # This process and everything it starts form one group that the parent
+    # stops as a whole, on timeout or interrupt. A CLI agent given a session
+    # of its own would be outside that group, and would be left running when
+    # the parent kills this process before it can clean up.
+    share_process_group_with_commands()
     try:
         if args.config:
             executor = IntegrationConfig.from_file(args.config).build_executor()

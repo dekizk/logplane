@@ -217,6 +217,7 @@ logplane demo-worker alice --block 2           # task 2 asks a human for a decis
 logplane demo-worker alice --fail 2            # one retryable failure
 logplane demo-worker alice --fail-permanently 2
 logplane demo-worker alice --delay 30          # slow enough to kill mid-task
+logplane demo-worker alice --delay 30 --attempt-timeout 5   # a hung attempt, timed out and retried
 ```
 
 `submit --depends-on` builds a DAG from the command line; repeat it for

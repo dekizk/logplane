@@ -961,6 +961,7 @@ def _doctor(client: ObserverClient, *, now: float, lease_seconds: float) -> dict
         "active_lease_expired",
         "active_worker_missing",
         "active_worker_replaced",
+        "active_worker_stopped",
         "cancellation_pending",
         "pause_pending",
         "resume_pending",
@@ -1009,6 +1010,7 @@ def _doctor(client: ObserverClient, *, now: float, lease_seconds: float) -> dict
         "workers": len(state.workers),
         "healthy_workers": sum(worker["status"] == "healthy" for worker in workers),
         "stale_workers": sum(worker["status"] == "stale" for worker in workers),
+        "stopped_workers": sum(worker["status"] == "stopped" for worker in workers),
         "ignored_replay_events": invalid_count,
         "pending_reconciliation": pending_reconciliation,
         "pm": pm,
@@ -1063,7 +1065,8 @@ def _format_doctor(value: dict) -> str:
     lines = [
         f"Bus: {'healthy' if value['ok'] else 'unhealthy'} · {value['bus_url']} · schema v{value['schema_version']}",
         f"History: {value['coordination_events']} coordination events · {value['tasks']} tasks",
-        f"Workers: {value['healthy_workers']} healthy · {value['stale_workers']} stale",
+        f"Workers: {value['healthy_workers']} healthy · {value['stale_workers']} stale"
+        + (f" · {value['stopped_workers']} stopped" if value.get("stopped_workers") else ""),
     ]
     pm = value.get("pm") or {}
     status = pm.get("status")
@@ -1305,6 +1308,11 @@ def add_demo_worker_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--delay", type=_nonnegative_number, default=0.5, metavar="SECONDS",
         help="simulated work time per task (default 0.5); raise it to kill a worker mid-task",
+    )
+    parser.add_argument(
+        "--attempt-timeout", type=_positive_number, default=None, metavar="SECONDS",
+        help="stop any attempt that runs longer than this and report it as a "
+             "retryable failure (default: no limit)",
     )
 
 

@@ -282,6 +282,44 @@ reopens a task that ran out of either allowance, and its
 `--additional-retries N` then allows exactly N further assignments in total,
 whether each ends in a failure or a lost worker.
 
+Stopping a worker on purpose is not losing one. A worker stopped with Ctrl-C
+or `SIGTERM` that has work running first publishes `agent.stopping`, so the
+coordinator sends it nothing more. It cancels its running attempts and waits
+for its executors to return, still heartbeating so that the work is not
+handed to another worker while it may still be running here. Then it
+publishes `agent.stopped`. The coordinator hands the work back the moment it
+reads that, without waiting for the lease to run out, and does not count it:
+the next attempt can start on another worker within a second, and "lost
+workers" and the retry budget are untouched. `logplane workers` shows the
+worker as `stopping` and then `stopped`, and it is given no new work until a
+new process registers under the name. Starting the worker again straight away
+is safe: the hand-back is remembered against the work the old process held,
+not against the name. An assignment to the old process that is recorded only
+after its replacement registered is handed back at once and spends no
+allowance either.
+
+The executor and its adapter's `cancel()` and `close()` hooks share one
+10-second grace period. An executor or hook that ignores cancellation for
+longer does not keep the worker looking alive: the worker stops heartbeating
+and publishes `agent.stopped` anyway, and the work moves on. The old call may
+then still be running alongside the new attempt, and the process cannot exit
+until it returns.
+
+Code that embeds `WorkerRuntime` can call `runtime.stop()` from any thread for
+the same orderly stop. It returns immediately: cancelling the executors, the
+wait for them and the announcements happen in the background, so the work is
+handed back even if the event stream is quiet. Executors may therefore still
+be running when `stop()` returns; `run()` returning is what says they have
+stopped or been given up on.
+
+A worker that stops itself over a failure, including an unexpected
+event-stream error, announces the stop as `requested: false` if the bus is
+reachable. Its work is also handed back at once,
+but an attempt it had already started counts as a lost worker; one it had not
+started never does. If the announcements cannot be delivered, or the worker
+is killed outright (`SIGKILL`, a crash, a power cut), nothing is announced
+and the lease rules above apply as before.
+
 The coordinator also avoids expiring leases it cannot judge. Old heartbeats
 mean it was not watching, not that workers died, in three cases: when it
 starts, when its event stream reconnects after any break, and when it has not
@@ -355,7 +393,7 @@ why they stopped in their exit status:
 | --- | --- |
 | 0 | it was asked to: Ctrl-C, or a replacement instance with the same name registered |
 | 75 | it could not reach the bus: the disconnect timeout ran out, or it could not read the log to check an incoming assignment |
-| 1 | of another failure: the bus refused a heartbeat or lifecycle write (a 4xx answer), or an assignment could not be resolved safely |
+| 1 | of another failure: the bus refused a heartbeat or lifecycle write (a 4xx answer), an assignment could not be resolved safely, or an executor ignored cancellation after an [attempt timeout](#cancellation-and-deadlines) |
 
 The second cause of 75 does not wait for the timeout and applies whether or
 not one is set: a worker that cannot verify an incoming assignment stops at
@@ -443,7 +481,47 @@ adapters that provide it, and suppresses late lifecycle output. This stops
 local execution at the cutoff even if PM reconciliation is temporarily down;
 the PM remains responsible for recording the authoritative terminal event.
 Python threads cannot be force-killed, so side effects must still be
-idempotent. Cancelled or deadline-exceeded prerequisites propagate
+idempotent.
+
+**Limiting one attempt.** A deadline bounds the whole task, and a worker's
+heartbeat says only that the worker process is alive, not that the agent is
+getting anywhere. So an executor with no time limit of its own, stuck on a
+call that never answers, holds its task and its worker indefinitely. A
+worker can be given a limit on each attempt:
+
+```sh
+logplane demo-worker alice --attempt-timeout 600
+```
+
+or `WorkerRuntime(..., attempt_timeout_seconds=600)` in code. It is off by
+default. When an attempt has been executing for that long, the worker calls
+the executor's `cancel(assignment_id)` and reports the attempt as
+`task.attempt_failed` with code `attempt_timeout`, a retryable failure, so the
+task is retried within its retry budget like any other failed attempt. The
+worker carries on with its next assignment.
+
+- The limit is wall-clock time from the moment execution starts, and it
+  includes any time the agent spends waiting for a person. Do not set it on a
+  worker whose agent waits for tool-call approvals.
+- The Claude Code, Codex, Hermes and OpenClaw example workers and the CLI and
+  HTTP adapters already limit each attempt themselves (`--timeout`,
+  `timeout_seconds`); the Claude Code worker's limit does not count approval
+  waits. This setting is for executors that have no limit: in-process Python
+  agents and your own `Executor` classes.
+- An executor has 10 seconds to return after being cancelled. If it does not
+  (Python code blocked in a call cannot be interrupted from outside), the
+  worker retires: the slot that call still occupies cannot be reused, and a
+  worker that kept heartbeating would be handed assignments it could never
+  start. From that moment it accepts no work, stops renewing its lease, and
+  publishes `agent.stopping` so the retry is not sent back to it. It tries for
+  up to 10 seconds to report the timeout, then announces that it has stopped
+  and ends with exit status 1. If none of those messages gets through, the
+  lease running out frees its tasks as for any lost worker. The process cannot
+  exit until the stuck call returns, so a supervisor may need to kill it. Give
+  in-process agents a `cancel` that works, or their own timeouts, to avoid
+  this.
+
+Cancelled or deadline-exceeded prerequisites propagate
 `task.dependency_failed` to downstream DAG tasks. Terminal tasks are not
 revived; create a new task to record new intent.
 

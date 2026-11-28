@@ -1,10 +1,15 @@
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from logplane import executors
 from logplane.executors import (
     AssignmentContext,
     Blocked,
@@ -214,6 +219,8 @@ class SubprocessConformanceTests(ExecutorConformanceMixin, unittest.TestCase):
                 pass
 
         class StartedProcess:
+            pid = 4_000_001  # never signalled for real: killpg is patched below
+
             def __init__(self):
                 self.stdin = FailingStdin()
                 self.stdout = EmptyPipe()
@@ -233,13 +240,202 @@ class SubprocessConformanceTests(ExecutorConformanceMixin, unittest.TestCase):
                 self.returncode = -9
 
         executor = SubprocessExecutor(["agent"])
-        with patch("logplane.executors.subprocess.Popen", return_value=StartedProcess()):
+        with (
+            patch("logplane.executors.subprocess.Popen", return_value=StartedProcess()),
+            patch("logplane.executors.os.killpg", side_effect=ProcessLookupError) as killpg,
+        ):
             result = executor.execute(assignment())
+        if os.name == "posix":
+            self.assertTrue(killpg.called)
+            self.assertEqual({4_000_001}, {call.args[0] for call in killpg.call_args_list})
         self.assertIsInstance(result, RetryableFailure)
         self.assertEqual("subprocess_io_failed", result.code)
         self.assertIn("write failed", result.reason)
         self.assertEqual({}, executor._processes)
         self.assertEqual(set(), executor._cancelled)
+
+
+# The command prints one outcome, after starting a child that appends to a
+# file for as long as it lives. A test knows the child is gone when the file
+# stops growing, which works even where exited processes linger as zombies.
+CHILD = "import sys,time\nwhile True:\n    open(sys.argv[1],'a').write('x'); time.sleep(0.02)\n"
+PARENT = (
+    "import json,os,subprocess,sys,time\n"
+    "sys.stdin.read()\n"
+    "options = json.loads(sys.argv[2])\n"
+    "child = subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]],\n"
+    "                         stdout=None if options.get('inherit') else subprocess.DEVNULL)\n"
+    "while not os.path.exists(sys.argv[1]) or not os.path.getsize(sys.argv[1]):\n"
+    "    time.sleep(0.01)\n"
+    "if options.get('ignore_term'):\n"
+    "    import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "if options.get('hang'):\n"
+    "    time.sleep(60)\n"
+    "print(json.dumps({{'status': 'completed', 'summary': 'own group: ' + str(os.getpgrp() == os.getpid())}}))\n"
+).format(child=CHILD)
+
+
+@unittest.skipIf(os.name != "posix", "process groups are a POSIX mechanism")
+class SubprocessProcessGroupTests(unittest.TestCase):
+    """An attempt that ends takes the processes it started with it."""
+
+    def executor(self, marker, **options):
+        timeout = options.pop("timeout", 20)
+        return SubprocessExecutor(
+            [sys.executable, "-c", PARENT, str(marker), json.dumps(options)], timeout=timeout
+        )
+
+    def wait_for_child(self, marker):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.stat().st_size:
+                return
+            time.sleep(0.01)
+        self.fail("the command never started its child")
+
+    def assert_child_stopped(self, marker):
+        size = marker.stat().st_size
+        time.sleep(0.3)  # fifteen of the child's write intervals
+        self.assertEqual(size, marker.stat().st_size, "the command's child is still running")
+
+    def test_a_timeout_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            result = self.executor(marker, hang=True, timeout=1.0).execute(assignment())
+            self.assertEqual("subprocess_timeout", result.code)
+            self.assertTrue(marker.stat().st_size)
+            self.assert_child_stopped(marker)
+
+    def test_cancellation_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True)
+            results = []
+            thread = threading.Thread(target=lambda: results.append(executor.execute(assignment())))
+            thread.start()
+            self.wait_for_child(marker)
+            executor.cancel("task:4:attempt:2")
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("subprocess_cancelled", results[0].code)
+            self.assert_child_stopped(marker)
+
+    def test_close_stops_the_commands_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True)
+            thread = threading.Thread(target=lambda: executor.execute(assignment()))
+            thread.start()
+            self.wait_for_child(marker)
+            executor.close()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assert_child_stopped(marker)
+
+    def test_a_command_that_ignores_sigterm_is_killed_with_its_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            executor = self.executor(marker, hang=True, ignore_term=True)
+            results = []
+            thread = threading.Thread(target=lambda: results.append(executor.execute(assignment())))
+            thread.start()
+            self.wait_for_child(marker)
+            time.sleep(0.2)  # let the command install its SIGTERM handler
+            started = time.monotonic()
+            executor.cancel("task:4:attempt:2")
+            thread.join(6)
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started, 5)
+            self.assert_child_stopped(marker)
+
+    def test_a_child_left_running_after_a_normal_exit_is_stopped(self):
+        # The child inherits the command's stdout, so before this it also kept
+        # the output pipe open after the command had exited.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory, "alive")
+            started = time.monotonic()
+            result = self.executor(marker, inherit=True).execute(assignment())
+            self.assertIsInstance(result, Completed)
+            self.assertEqual("own group: True", result.summary)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assert_child_stopped(marker)
+
+    def test_stopping_twice_or_after_exit_is_harmless(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        process.wait(5)
+        executors._stop_process_group(process)
+        executors._stop_process_group(process)
+        self.assertEqual(0, process.returncode)
+
+    def test_a_process_that_owns_cleanup_keeps_commands_in_its_own_group(self):
+        # The adapter-check probe is stopped as one process group by its
+        # parent. A command given its own session would escape that, so there
+        # the command stays in the group and only it is signalled directly.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(executors, "_commands_get_own_group", True):
+            executors.share_process_group_with_commands()
+            marker = Path(directory, "alive")
+            with patch("logplane.executors.os.killpg") as killpg:
+                result = self.executor(marker).execute(assignment())
+            self.assertIsInstance(result, Completed)
+            self.assertEqual("own group: False", result.summary)
+            killpg.assert_not_called()  # it would have signalled this test run
+            # Nothing here stops the child: that is the group owner's job.
+            size = marker.stat().st_size
+            time.sleep(0.2)
+            self.assertGreater(marker.stat().st_size, size)
+            subprocess.run(["pkill", "-f", str(marker)], check=False)
+
+    def test_the_timeout_also_covers_delivering_the_assignment(self):
+        # More input than a pipe holds, and a command that never reads it.
+        # The write used to block before the timeout had started.
+        executor = SubprocessExecutor(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=0.5, max_protocol_bytes=1024 * 1024,
+        )
+        results = []
+        thread = threading.Thread(target=lambda: results.append(
+            executor.execute(assignment(context={"blob": "x" * 256_000}))), daemon=True)
+        started = time.monotonic()
+        thread.start()
+        thread.join(8)
+        try:
+            self.assertFalse(thread.is_alive(), "blocked writing to a command that never reads")
+            self.assertEqual("subprocess_timeout", results[0].code)
+            self.assertLess(time.monotonic() - started, 6)
+        finally:
+            executor.close()
+
+    def test_a_large_assignment_still_arrives_whole(self):
+        code = ("import json,sys; request=sys.stdin.read(); "
+                "print(json.dumps({'status':'completed','summary':str(len(request))}))")
+        executor = SubprocessExecutor([sys.executable, "-c", code], timeout=20,
+                                      max_protocol_bytes=1024 * 1024)
+        result = executor.execute(assignment(context={"blob": "x" * 256_000}))
+        self.assertIsInstance(result, Completed)
+        self.assertGreater(int(result.summary), 256_000)
+
+    def test_a_command_closed_before_it_started_is_stopped_without_deadlock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = self.executor(Path(directory, "alive"), hang=True)
+            started = threading.Event()
+            spawn = subprocess.Popen
+
+            def spawn_then_close(*args, **kwargs):
+                process = spawn(*args, **kwargs)
+                executor.close()  # ownership is lost while the command starts
+                started.set()
+                return process
+
+            results = []
+            with patch("logplane.executors.subprocess.Popen", side_effect=spawn_then_close):
+                thread = threading.Thread(
+                    target=lambda: results.append(executor.execute(assignment())), daemon=True)
+                thread.start()
+                thread.join(8)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual("subprocess_cancelled", results[0].code)
+            self.assertEqual(set(), executor._own_groups)
 
 
 class AssignmentContextTests(unittest.TestCase):
